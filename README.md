@@ -3,8 +3,10 @@
 Motor de inferencia LLM en el navegador (WebGPU) + empaquetador offline de pesos.
 Sustituye a `@litert-lm/core` en Elffuss Claw/Code.
 
+Elffuss Engine vive ahora en la organización UtopiaIA de GitHub, en github.com/utopia-ia/elffuss-engine. Se movió desde github.com/KikoCis/elffuss-engine el 23 de octubre de 2026; la dirección antigua redirige.
+
 > **El motor (`js/`) es Apache-2.0** y se publica en
-> `github.com/KikoCis/elffuss-engine`. El empaquetador de pesos y el compresor
+> `github.com/utopia-ia/elffuss-engine`. El empaquetador de pesos y el compresor
 > NO viven en este repositorio y no se publican. Ver `LICENSE`. El plan y el
 > porqué están en `ENGINE-PLAN.md`.
 >
