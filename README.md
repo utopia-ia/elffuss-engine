@@ -1,134 +1,132 @@
-# Elffuss Engine — runtime de inferencia propio
+<div align="center">
 
-Motor de inferencia LLM en el navegador (WebGPU) + empaquetador offline de pesos.
-Sustituye a `@litert-lm/core` en Elffuss Claw/Code.
+<img src="assets/logo.svg" alt="" width="72">
 
-Elffuss Engine vive ahora en la organización UtopiaIA de GitHub, en github.com/utopia-ia/elffuss-engine. Se movió desde github.com/KikoCis/elffuss-engine el 23 de octubre de 2026; la dirección antigua redirige.
+# Elffuss Engine
 
-> **El motor (`js/`) es Apache-2.0** y se publica en
-> `github.com/utopia-ia/elffuss-engine`. El empaquetador de pesos y el compresor
-> NO viven en este repositorio y no se publican. Ver `LICENSE`. El plan y el
-> porqué están en `ENGINE-PLAN.md`.
->
-> Este repositorio (Gitea) es donde se trabaja; el de GitHub es el espejo
-> publicado. Antes de empujar allí, comprobar que no sale nada que no deba:
-> rutas de disco, medidas absolutas de la máquina ni recetas de cuantización.
+**A WebGPU inference engine written from scratch, for GGUF models, in a web page.**
 
-## Qué vive aquí y qué no
+Shaders in WGSL, a GGUF reader, a tokenizer and a sampler, with no dependencies and no build step. The engine behind the large
+models of Claw and Code, up to a 27B, on your own graphics card and with no server.
 
-| | dónde | licencia |
+[![License](https://img.shields.io/badge/license-Apache--2.0-c8a06a?style=flat-square)](LICENSE)
+[![Dependencies](https://img.shields.io/badge/dependencies-none-5b6169?style=flat-square)](#layout)
+[![Runs in](https://img.shields.io/badge/runs%20in-WebGPU-8272ff?style=flat-square)](#what-it-runs)
+
+[Elffuss](https://elffuss.com) · [Claw](https://github.com/utopia-ia/elffuss-claw) · [Code](https://github.com/utopia-ia/elffuss-code) · [Shared core](https://github.com/utopia-ia/elffuss)
+
+</div>
+
+> Elffuss Engine now lives in the UtopiaIA organization on GitHub, at github.com/utopia-ia/elffuss-engine. It moved from github.com/KikoCis/elffuss-engine on 23 October 2026; the old address redirects.
+
+---
+
+**In this repository:** [what it is](#what-it-is) · [what it runs](#what-it-runs) · [what is in it](#what-is-in-this-repository) · [layout](#layout) · [use it](#use-it-in-an-app) · [verification](#verification) · [licence](#licence)
+
+---
+
+## What it is
+
+Claw and Code run Google's Gemma 4 through LiteRT-LM by default, and a small Qwen3.5 through transformers.js on phones. The Elffuss
+engine is the third runtime, and the one we wrote. It lets a web page load a GGUF file and run it on the GPU: parsing, tokenizing,
+the attention and state-space layers, the sampler, all as plain ES modules and WGSL shaders.
+
+Its arithmetic is checked against llama.cpp, bit for bit where a result has to be exact (see [verification](#verification)).
+
+## What it runs
+
+- Qwen3.5 0.8B, and the other models of the `qwen35` architecture (a hybrid of state-space and attention layers).
+- As advanced options, MiniCPM5 2B and a 27B model: the ternary build of Qwen3.8, packed in a format that is not part of llama.cpp
+  (`PQ2_0` and `PTQ1_0`, with a Hadamard rotation on the activations that the file declares in its metadata).
+- Weight types: `F32`, `F16`, `Q8_0`, `Q2_K`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ1_S`, `IQ2_XXS`, and the two ternary formats above.
+
+The 27B is slow and large. It is an advanced option, not the default.
+
+## What is in this repository
+
+| | where | licence |
 |---|---|---|
-| Motor WebGPU (`js/`) | este repo + GitHub público | Apache-2.0 |
-| Bancos (`tests/`) | este repo | Apache-2.0 |
-| Empaquetador / compresor | **fuera de este repo** | no se publica |
-| App Elffuss Claw (chat, agente, UI) | `../elffuss-claw`, GitHub público | Apache-2.0 |
+| The WebGPU engine (`js/`) | this repository | Apache-2.0 |
+| The tests (`tests/`) and the reference dumps' scripts (`ref/`) | this repository | Apache-2.0 |
+| The apps that use it: Claw and Code | [their own repositories](https://github.com/utopia-ia) | Apache-2.0 |
 
-## Qué protege y qué no un repo de código de navegador
+This repository is a public mirror, so it can be a little behind the version that is live. The JavaScript served to a browser can be read by anyone with the developer tools open, so the engine is open.
 
-El `.js` que se sirve al navegador lo lee cualquiera con las devtools abiertas:
-eso es física del medio, no una decisión de este repo. Pretender que el motor
-era cerrado mientras se servía en tres sitios públicos era una postura que el
-medio no sostiene, y por eso `js/` es Apache-2.0.
-Lo que sí queda fuera del alcance de cualquiera es el empaquetador (corre en
-nuestra máquina, no viaja al cliente), y ahí es donde conviene que esté el
-trabajo que no se quiere regalar: la receta de cuantización y la calibración.
+## Layout
 
-## Cómo se enchufa en la app pública
+```
+js/       the runtime: ES modules, no dependencies, no bundler
+          registro.js is the list of models (where they live and whether one is available);
+          it is separate from provider.js so an app can ask what is available without loading the engine
+tests/    plain Node tests (parser, layouts) and browser tests (the GPU)
+ref/      scripts that dump ground truth from llama.cpp, which the tests assert against
+docs/     notes
+```
 
-El motor **no se commitea** en `elffuss-claw`. Se copia al árbol de trabajo
-local y de ahí sale por rsync en el deploy, igual que ya se hace con los pesos
-de `web/models/`:
+## Use it in an app
+
+The engine is not committed into the apps. It is copied into the working tree of the app and shipped with it:
 
 ```bash
-./sync-to-claw.sh                  # js/ → ../elffuss-claw/web/js/engine/  (gitignorado allí)
-./sync-to-claw.sh ../elffuss-code  # y a code.elffuss, que ofrece los mismos modelos
+./sync-to-claw.sh                  # js/ to ../elffuss-claw/web/js/engine/  (git-ignored there)
+./sync-to-claw.sh ../elffuss-code  # and to Code, which offers the same models
 ```
 
-## Estructura
-
-```
-js/       módulos del runtime (ES modules vanilla, sin deps ni bundler)
-          · registro.js — qué modelos hay, dónde viven y `disponible(id)`.
-            Va SEPARADO de provider.js porque la app necesita sondear
-            disponibilidad sin bajarse el motor entero, y porque tener las
-            URLs en dos sitios ya dejó al selector mirando un fichero muerto.
-rust/     empaquetador/compresor offline (CLI, nunca viaja al navegador)
-tests/    tests de Node puro (parser, layouts) — sin GPU ni DOM
-ref/      volcados de verdad de referencia contra los que asertan los tests
-```
-
-## Verificación
+## Verification
 
 ```bash
-npm run check                # sintaxis de todo
-npm test                     # parser GGUF: fixture + modelos reales de disco
-npm run test:quant-cpu       # los 8 tipos, referencia de CPU vs llama.cpp (sin GPU)
-npm run test:quant           # los 8 tipos en la GPU: dequant, matmul y gather
-npm run test:tiny            # forward completo con seis tipos MEZCLADOS
-npm run test:gpu             # ... y el resto, con --model si se tiene el fichero
+npm run check                # syntax of everything
+npm test                     # GGUF parser: fixture and real models from disk
+npm run test:quant-cpu       # every weight type, CPU reference against llama.cpp (no GPU)
+npm run test:quant           # every weight type on the GPU: dequantization, matmul and gather
+npm run test:tiny            # a full forward pass with six types MIXED
+npm run test:gpu             # the rest, with --model if you have the file
 ```
 
-### Cómo se validan los tipos cuantizados
+### How the quantized types are validated
 
-Ocho: `F32`, `F16`, `Q8_0` (el 0.8B) y los cinco del 27B — `IQ1_S`, `IQ2_XXS`,
-`Q2_K`, `Q4_K`, `Q5_K`. Los ocho comparten andamio de shader y se diferencian
-solo en el desempaquetado, así que lo que hay que probar es exactamente eso.
+**Dequantization is required to match llama.cpp bit for bit**, not within a tolerance. The truth is generated by `gguf-py`, which is
+llama.cpp's own decoder, over deterministic synthetic blocks (`ref/dump-quant-truth.py`). It is deliberate that the truth comes from
+outside: the CPU reference in JavaScript and the WGSL shader are written by the same head, and a layout misunderstood would cancel
+itself out.
 
-**La descuantización se exige BIT A BIT contra llama.cpp**, no con tolerancia.
-La verdad la genera `gguf-py` — el descodificador del propio llama.cpp — sobre
-bloques sintéticos deterministas (`ref/dump-quant-truth.py`). Es deliberado que
-la verdad venga de fuera: la referencia de CPU en JS y el shader WGSL los
-escribe la misma cabeza, y un layout mal entendido se cancelaría consigo mismo.
+The only margin allowed: in `Q2_K`, `Q4_K` and `Q5_K` the weight comes out as `d·q − m`, and IEEE lets a GPU fuse the multiplication
+and the subtraction into one FMA. Both forms are legal and give different bits, so the reference computes **both** and accepts either.
+It is still exact equality, against the set of results the standard allows.
 
-El único margen que se concede: en `Q2_K`/`Q4_K`/`Q5_K` el peso sale de `d·q − m`
-y IEEE permite a la GPU fundir la multiplicación y la resta en un FMA. Las dos
-formas son legales y dan bits distintos, así que la referencia calcula **las
-dos** y se acepta cualquiera. Sigue siendo igualdad exacta, contra el conjunto
-de resultados que el estándar permite.
+**The matmul** is compared with an f64 reference (JavaScript numbers are doubles), with NMSE and with the maximum error measured
+**against the scale of the output**, not against each element: a row whose terms cancel gives a tiny result, and an ordinary absolute
+error there becomes a huge relative one that says nothing about the kernel.
 
-El **matmul** se compara contra una referencia en f64 (los `Number` de
-JavaScript son dobles) con NMSE y con el error máximo medido **contra la escala
-de la salida**, no contra cada elemento: una fila cuyos sumandos se cancelan da
-un resultado diminuto, y ahí un error absoluto normal se convierte en un
-relativo enorme que no dice nada del kernel.
+The reference always uses **the same weights the GPU uses**, already dequantized. Comparing it with the f32 weights from before
+quantizing would measure the quantization error (about 1e-3), which buries the kernel's own and makes the test useless.
 
-La referencia se calcula siempre con **los mismos pesos que usa la GPU**, ya
-descuantizados. Compararla contra los f32 de antes de cuantizar mediría el error
-de cuantización (~1e-3), que sepulta el del kernel y deja el test inútil.
+**`test:tiny` answers the question of the large model.** It builds in memory a toy `qwen35` with the same shape as the real one and
+with six types spread over its tensors, and writes it TWICE: quantized, and in F32 with the weights already dequantized. Both must
+give the same logits. That does not check that the model loads: it checks that the quantized path *computes the same thing* all the
+way to the output. A tensor read with the wrong type survives "loads without error", but not this.
 
-**`test:tiny` es el que responde la pregunta del 27B.** Fabrica en memoria un
-qwen35 de juguete (`tests/synth-gguf.mjs`) con la misma forma que el real y con
-los seis tipos repartidos entre sus tensores, y lo escribe DOS veces: cuantizado
-y en F32 con los pesos ya descuantizados. Los dos tienen que dar los mismos
-logits. Eso no comprueba que el modelo cargue, comprueba que el camino
-cuantizado *calcula lo mismo* hasta la salida — un tensor leído con el tipo
-equivocado sobrevive a «carga sin error», a esto no.
+The GPU tests run **inside Chromium**, not in Node: the limits, features and bugs that matter are the browser's. `tests/browser.mjs`
+serves the repository over `http://127.0.0.1` (with `Range` support, which is how the engine reads weights), opens Chromium and runs
+the test module in the page. It reuses the Playwright of `../elffuss-claw/tests`, so nothing is installed here; if it cannot find it,
+it skips, loudly. You can force it with `PLAYWRIGHT_CORE=…`, `CHROMIUM_PATH=…`, `HEADED=1` and `VERBOSE=1`.
 
-Los tests de GPU corren **dentro de Chromium**, no en Node: los límites, las
-features y los bugs que importan son los del navegador. `tests/browser.mjs`
-sirve el repo por `http://127.0.0.1` (con soporte de `Range`, que es como el
-motor lee los pesos), abre Chromium y ejecuta el módulo de test en la página.
-Reutiliza el playwright de `../elffuss-claw/tests` — no se instala nada aquí; si
-no lo encuentra, se salta en voz alta. Se puede forzar con `PLAYWRIGHT_CORE=…`,
-`CHROMIUM_PATH=…`, `HEADED=1` y `VERBOSE=1`.
+**Two traps the harness closes**, both of which look like a GPU failure and are not:
 
-**Dos trampas que el arnés cierra** (las dos hacen que parezca un fallo de GPU
-cuando no lo es):
+- `about:blank` is **not a secure context**, so `navigator.gpu` is `undefined`. That is why there is a server and not a `setContent()`.
+- With `--enable-unsafe-webgpu` and **without** fixing the native graphics backend, Chromium returns a **SwiftShader** adapter: pure
+  CPU dressed as a GPU. It works, passes the tests and falsifies any measurement. The harness aborts if it detects software.
 
-- `about:blank` **no es contexto seguro** → `navigator.gpu` sale `undefined`.
-  Por eso hay servidor y no un `setContent()`.
-- Con `--enable-unsafe-webgpu` y **sin** fijar el backend gráfico nativo,
-  Chromium devuelve un adaptador **SwiftShader**: CPU pura disfrazada de GPU. Funciona, pasa los
-  tests y falsea cualquier medición. El arnés aborta si detecta software.
-
-Los tests comparan contra una **verdad de referencia** sacada del lector de
-llama.cpp, no de nuestro parser — un test que compara el código consigo mismo no
-prueba nada. Para regenerarla (o añadir modelos):
+The tests compare against ground truth taken from llama.cpp's reader, not from our parser: a test that compares the code with itself
+proves nothing. To regenerate it, or add models:
 
 ```bash
-PYTHONPATH=$HOME/llama.cpp/gguf-py OUT=ref/gguf-truth.json \
-  python3 ref/dump-truth.py <modelo.gguf> [más modelos…]
+PYTHONPATH=<llama.cpp>/gguf-py OUT=ref/gguf-truth.json \
+  python3 ref/dump-truth.py <model.gguf> [more models…]
 ```
 
-El volcado (`ref/*.json`) está gitignorado: pesa y se regenera. Si falta, los
-casos exhaustivos se saltan y lo dicen en voz alta.
+The dump (`ref/*.json`) is git-ignored: it is large and can be regenerated. If it is missing, the exhaustive cases are skipped, loudly.
+
+## Licence
+
+[Apache-2.0](LICENSE).
