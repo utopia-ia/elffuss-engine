@@ -1,0 +1,11 @@
+Elffuss Engine
+Copyright (c) 2026 UtopiaIA
+
+This product is licensed under the Apache License, Version 2.0; see LICENSE.
+
+js/quant-tables.js contains grid tables (iq1s_grid, iq2xxs_grid) copied from
+llama.cpp, ggml/src/ggml-common.h:
+
+  Copyright (c) 2023-2026 The ggml authors
+  Licensed under the MIT License. The complete licence text is reproduced at
+  the top of js/quant-tables.js.

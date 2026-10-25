@@ -1,0 +1,23 @@
+{
+  "name": "@elffuss/engine",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Modular WebGPU runtime for GGUF language models in a web page. No dependencies, no build step.",
+  "type": "module",
+  "license": "Apache-2.0 AND MIT",
+  "repository": { "type": "git", "url": "https://github.com/utopia-ia/elffuss-engine" },
+  "homepage": "https://github.com/utopia-ia/elffuss-engine#readme",
+  "bugs": "https://github.com/utopia-ia/elffuss-engine/issues",
+  "exports": {
+    ".":            "./js/provider.js",
+    "./registry":   "./js/registro.js",
+    "./gguf":       "./js/gguf.js",
+    "./tokenizer":  "./js/tokenizer.js",
+    "./sample":     "./js/sample.js",
+    "./device":     "./js/device.js",
+    "./model":      "./js/model.js",
+    "./package.json": "./package.json"
+  },
+  "files": ["js", "assets", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE"],
+  "sideEffects": false
+}
