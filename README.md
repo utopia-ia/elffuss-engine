@@ -36,7 +36,7 @@ like this one from it.
   import * as engine from './js/provider.js';
 
   console.log(engine.models());          // [{ id, label }, …]
-  engine.configure('qwen35-0.8b');       // the small model from Hugging Face (already the default)
+  engine.configure('qwen35-0.8b');       // the small model, read from Hugging Face
   await engine.load((status) => console.log(status));
 
   engine.setSampling({ temperature: 0.7, seed: 1, maxTokens: 120 });
@@ -76,14 +76,20 @@ This exact page is the one we ran, in headless Chrome, against this tree served 
 - The model of the quick start: Qwen3.5 0.8B in `Q8_0`, from
   [`ggml-org/Qwen3.5-0.8B-GGUF`](https://huggingface.co/ggml-org/Qwen3.5-0.8B-GGUF) on Hugging Face, Apache-2.0 as its
   GGUF header declares. Its architecture is `qwen35`, a hybrid of state-space and attention layers.
-- `models()` also lists two larger models that are hosted for the Elffuss apps. They are not meant to be loaded from
-  other sites.
+- The default model of the registry: LFM3 1.7B in `Q8_0`, the GGUF that Liquid AI publishes in
+  [`LiquidAI/LFM3-1.7B-GGUF`](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF), under the
+  [LFM Open License v1.0](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/blob/main/LICENSE). Its architecture is
+  `lfm3`: gated short convolutions with sliding-window and global attention. The registry reads it from the host of
+  the Elffuss apps, which is why the quick start selects the Qwen model instead.
+- `models()` also lists two larger models that are hosted for the Elffuss apps. They, and the copy of LFM3 the
+  registry points at, are not meant to be loaded from other sites.
 - Weight types the engine reads: `F32`, `F16`, `BF16`, `Q8_0`, `Q2_K`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ1_S`, `IQ2_XXS`,
   and two third-party ternary formats, `PQ2_0` and `PTQ1_0`.
 
-Other GGUF files may fail to load, or load and answer worse without an error: the engine has two architecture
-profiles (`qwen35` and `llama`), reads only the `gpt2` tokenizer family, and always writes a ChatML prompt instead of
-reading the chat template of the file.
+Other GGUF files may fail to load, or load and answer worse without an error: the engine has three architecture
+profiles (`qwen35`, `llama` and `lfm3`), reads only the `gpt2` tokenizer family, and always writes a ChatML prompt
+instead of running the chat template of the file. It reads the template only to adjust that prompt: whether the model
+reasons, how its turns are closed and, for `lfm3`, the start token.
 
 ## Limits of this version
 
@@ -109,7 +115,7 @@ reading the chat template of the file.
 ## Layout
 
 ```
-js/         the runtime: 19 ES modules, served as they are written
+js/         the runtime: 20 ES modules, served as they are written
             provider.js    the chat API of the quick start
             registro.js    the model registry; it imports nothing, so a page can list models without the engine
             gguf.js        the GGUF reader, which reads by byte ranges

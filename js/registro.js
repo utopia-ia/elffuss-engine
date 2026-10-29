@@ -18,6 +18,36 @@
 // content-length real y avisa si el fichero de origen ha cambiado, porque un
 // cambio de cuantización aguas arriba altera la salida sin previo aviso.
 export const MODELS = {
+  // LFM3-1.7B (LiquidAI) en Q8_0: el modelo POR DEFECTO del motor.
+  //
+  // Híbrido de otra familia: 13 capas de convolución corta (sin estado más allá
+  // de su ventana de 6 tokens), 6 de atención global y 5 de atención por
+  // ventana de 256. Solo las 11 de atención pagan contexto.
+  //
+  // RAZONA. Sin razonar se queda claramente por detrás en tareas de agente;
+  // razonando se pone a la altura de modelos bastante más grandes, y el
+  // razonamiento le cuesta poco porque genera rápido.
+  //
+  // `muestreo` es el de su ficha para agentes y herramientas (0,1 / k50 / rep 1,1).
+  // `lote`: sin bucle recurrente dentro del despacho, un lote de prefill largo
+  // no compromete el escritorio (el forward se sigue troceando por capa y con
+  // respiros). Medido en la misma sesión: de 32 a 256, ×1,57; con el GEMM de
+  // ML Drift y un prompt de 2.048 tokens, 512 y 1.024 empatan por encima de 256.
+  //
+  // Licencia LFM Open License v1.0, NO Apache: se sirve con su LICENSE al lado
+  // (`licencia`), que es la condición para redistribuir los pesos.
+  'lfm3-1.7b': {
+    label: 'LFM3 1.7B · Q8_0',
+    url: 'https://m1.elffuss.com/lfm3-1.7b.q8',
+    bytes: 1846238496,
+    ctx: 32768,
+    razona: true,
+    presupuesto: 4000,
+    muestreo: { temperature: 0.1, topP: 1, topK: 50, minP: 0, presence: 0, repeatPenalty: 1.1 },
+    lote: 512,
+    licencia: 'https://m1.elffuss.com/lfm3-1.7b.LICENSE.txt',
+  },
+
   // MiniCPM5-2B en Q8_0.
   //
   // Entra sin tocar el motor porque su GGUF declara `general.architecture =

@@ -32,6 +32,7 @@ import {
 import { matmulFilasShader, filasPorGrupo } from './kernels.filas.wgsl.js';
 import { matmulGemmShader, soportaGemm, tkPara, TIPOS_GEMM } from './kernels.gemm.wgsl.js';
 import { hadamardShader } from './kernels.hadamard.wgsl.js';
+import { q8aDriftShader, f32aF16Shader, driftGemmShader, DRIFT_TPW, DRIFT_TPT } from './kernels.drift.wgsl.js';
 import {
   rmsnormShader, ropeShader, softmaxShader, swigluShader, addShader,
   ROPE_NORM, ROPE_NEOX,
@@ -601,6 +602,35 @@ export function createQuantOps(device, opts = {}) {
       //
       // No es un detalle: con 2 o 3 tokens se cae en cuanto hay un turno corto
       // de conversación, que es de lo más frecuente que hace un chat.
+      // ── Camino DRIFT (ver kernels.drift.wgsl.js) ───────────────────────────
+      // Q8_0 con lote largo y f16 en el dispositivo: descuantizar la matriz a
+      // f16 en su disposición, pasar las activaciones a f16 y el GEMM sin
+      // memoria compartida. Desde DRIFT_DESDE tokens: por debajo el grupo de 64
+      // tokens queda medio vacío y la descuantización no se amortiza.
+      const DRIFT_DESDE = globalThis.__ELFFUSS_DRIFT_DESDE || 64;
+      if (tokens >= DRIFT_DESDE && type === 'Q8_0' && globalThis.__ELFFUSS_DRIFT !== false &&
+          device.features.has('shader-f16') && rows % 16 === 0 && k % 4 === 0) {
+        const ks4 = k / 4;
+        const pq = await get('drift_q8', () => q8aDriftShader(256));
+        const wh = ctx.alloc(rows * k * 2, 'drift.w');
+        const totalW = rows * ks4;
+        await dispatchN(ctx, `drift_q8:r${rows}`, pq,
+          [wBuf, wh, ctx.uniform([new Uint32Array([rows, k, bpr, totalW])])], Math.ceil(totalW / 256));
+        const px = await get('drift_x16', () => f32aF16Shader(256));
+        const xh = ctx.alloc(tokens * k * 2, 'drift.x');
+        const n4 = tokens * ks4;
+        await dispatchN(ctx, 'drift_x16', px, [xBuf, xh, ctx.uniform([new Uint32Array([n4, 0, 0, 0])])], Math.ceil(n4 / 256));
+        // Forma (tokens por hilo, hilos por grupo) ajustable para el barrido; va
+        // en la clave del pipeline para que cada forma compile la suya.
+        const TPT = globalThis.__ELFFUSS_DRIFT_TPT || DRIFT_TPT, TPW = globalThis.__ELFFUSS_DRIFT_TPW || DRIFT_TPW;
+        const pg = await get(`drift_gemm_${TPT}_${TPW}`, () => driftGemmShader(TPT, TPW));
+        const y = ctx.alloc(rows * tokens * 4, 'matmul.y');
+        const og = rows / 16;
+        await dispatchXYZ(ctx, `drift:${type}:r${rows}b${bpr}`, pg,
+          [wh, xh, y, ctx.uniform([new Uint32Array([ks4, rows, tokens, 0])])],
+          Math.ceil(tokens / (TPW * TPT)), Math.min(og, 65535), Math.ceil(og / 65535));
+        return y;
+      }
       const GEMM_DESDE = 4;
       if (tokens >= GEMM_DESDE && globalThis.__ELFFUSS_GEMM !== false && puedeGemm) {
         // La forma de la tesela es ajustable para el barrido. Los CINCO números
@@ -872,8 +902,11 @@ export function createNNOps(device, opts = {}) {
 
     // RoPE sobre filas [head_dim, heads, tokens]. `mode` decide el pareado:
     // ROPE_NORM empareja adyacentes, ROPE_NEOX empareja i con i+nDims/2.
-    async rope(src, posBuf, { rows, ne0, heads, nDims, mode, freqBase, freqScale = 1 }) {
-      const p = await get('rope_' + WG_ROPE, () => ropeShader(WG_ROPE));
+    // `factores`: buffer f32 de nDims/2 divisores de frecuencia (`rope_freqs`), o null.
+    async rope(src, posBuf, { rows, ne0, heads, nDims, mode, freqBase, freqScale = 1, factores = null }) {
+      const p = factores
+        ? await get('rope_ff_' + WG_ROPE, () => ropeShader(WG_ROPE, true))
+        : await get('rope_' + WG_ROPE, () => ropeShader(WG_ROPE));
       const dst = ctx.alloc(rows * ne0 * 4, 'rope.out');
       // theta_scale en el host: acumular la potencia en el shader arrastra el
       // error de pow() y a posiciones grandes se nota.
@@ -883,16 +916,18 @@ export function createNNOps(device, opts = {}) {
         new Float32Array([thetaScale, freqScale, 0, 0]),
       ]);
       const total = rows * (nDims / 2);
-      await dispatchN(ctx, 'rope', p, [src, posBuf, dst, params], Math.ceil(total / WG_ROPE));
+      await dispatchN(ctx, 'rope', p, factores ? [src, posBuf, dst, params, factores] : [src, posBuf, dst, params],
+        Math.ceil(total / WG_ROPE));
       return dst;
     },
 
-    // Softmax por filas con máscara causal calculada en el shader.
-    async softmax(src, { rows, nKv, nQ, nPast = 0, scale = 1 }) {
+    // Softmax por filas con máscara causal calculada en el shader. `ventana` > 0
+    // añade la de atención por ventana deslizante (ver el shader).
+    async softmax(src, { rows, nKv, nQ, nPast = 0, scale = 1, ventana = 0 }) {
       const p = await get('softmax_' + WG_SM, () => softmaxShader(WG_SM));
       const dst = ctx.alloc(rows * nKv * 4, 'softmax.out');
       const params = ctx.uniform([
-        new Uint32Array([nKv, nQ, nPast, rows]), new Float32Array([scale, 0, 0, 0]),
+        new Uint32Array([nKv, nQ, nPast, rows]), new Float32Array([scale]), new Uint32Array([ventana, 0, 0]),
       ]);
       await dispatchRows(ctx, 'softmax', p, [src, dst, params], rows);
       return dst;
@@ -935,10 +970,12 @@ export function createSSMOps(device, opts = {}) {
     },
 
     // buf: [channels][window] con window = 3 + tokens. dst: [tokens][channels].
-    async conv(buf, w, channels, tokens) {
-      const p = await get('ssm_conv', () => ssmConvShader());
+    // `K` es el ancho del kernel: 4 en qwen35, 7 en la convolución corta de lfm3.
+    // Va en la clave del pipeline porque el shader lo lleva como constante.
+    async conv(buf, w, channels, tokens, K = SSM_CONV_K) {
+      const p = await get('ssm_conv_' + K, () => ssmConvShader(64, K));
       const dst = ctx.alloc(channels * tokens * 4, 'conv.out');
-      const params = ctx.uniform([new Uint32Array([channels, tokens, tokens + SSM_CONV_K - 1, 0])]);
+      const params = ctx.uniform([new Uint32Array([channels, tokens, tokens + K - 1, 0])]);
       await dispatchN(ctx, 'ssm_conv', p, [buf, w, dst, params], Math.ceil(channels * tokens / 64));
       return dst;
     },

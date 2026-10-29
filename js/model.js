@@ -22,7 +22,7 @@ import { leeRotacion } from './hadamard.js';
 import { createOps, ROPE_NEOX, ROPE_NORM } from './ops.js';
 import { readHParams, createState } from './state.js';
 import {
-  copyIntoShader, convWindowShader, convSaveShader, siluShader,
+  copyIntoShader, convWindowShader, convSaveShader, siluShader, mulCabezaShader,
 } from './kernels.model.wgsl.js';
 import { QUANT_TYPES } from './kernels.wgsl.js';
 
@@ -90,6 +90,14 @@ export function _getCederMs() { return cederMs; }
 // camino que trocea. A 1 se recupera el comportamiento de siempre.
 let cortaCada = 1;
 export function _setCorta(n) { cortaCada = Math.max(1, n | 0); }
+// Lo mismo para el DECODE (ver el bucle de capas). Con gancho para el A/B.
+// En CADA capa por defecto. Medido en la misma sesión, tres rondas alternadas:
+// ×1,30 en LFM3 y ×1,52 en Qwen3.5-0.8B. Un solo envío al
+// final del token dejaba el dispositivo parado mientras la CPU grababa cientos
+// de despachos; cortando, empieza con la primera capa. Cortar cada 2, 4 u 8
+// capas queda en medio. No cambia la numérica: la cola respeta el orden.
+let cortaDecode = globalThis.__ELFFUSS_CORTA_DECODE ?? 1;
+export function _setCortaDecode(n) { cortaDecode = Math.max(0, n | 0); }
 export function _getCorta() { return cortaCada; }
 // Cede un frame al bucle de eventos: en el navegador deja que el compositor
 // del sistema componga; fuera del DOM (tests) basta un turno de macrotarea.
@@ -477,8 +485,13 @@ export function createSession(model, opts = {}) {
     attn.strideCopy(src, { headDim: width, heads: 1, tokens, stride: rowWidth, offset });
 
   // El cierre común de los dos tipos de bloque: residual, norm, SwiGLU, residual.
+  // Con `postNorms` (lfm3) la salida del bloque y la del FFN pasan por su propia
+  // RMSNorm ANTES de sumarse al residual.
   async function feedForward(x, layerOut, i, tokens) {
     const n = tokens * E;
+    if (hp.postNorms) {
+      layerOut = await nn.rmsnorm(layerOut, get(`blk.${i}.post_attention_norm.weight`), tokens, E, eps);
+    }
     const res = await nn.add(x, layerOut, n);
     // El nombre sale del perfil, no de `has(...)`: si se decidiera por presencia
     // del tensor, un modelo al que le faltara dejaría de fallar y empezaría a
@@ -492,8 +505,40 @@ export function createSession(model, opts = {}) {
     // un canal despreciable no hace falta ni LEERLAS. Medir eso exige poder
     // verla, y sin sonda no se puede.
     const sw = P('ffn_sw', await nn.swiglu(gate, up, tokens * hp.ffnLength), tokens * hp.ffnLength);
-    const down = await mm(`blk.${i}.ffn_down.weight`, sw, E, hp.ffnLength, tokens);
+    let down = await mm(`blk.${i}.ffn_down.weight`, sw, E, hp.ffnLength, tokens);
+    if (hp.postNorms) down = await nn.rmsnorm(down, get(`blk.${i}.post_ffw_norm.weight`), tokens, E, eps);
     return await nn.add(res, down, n);
+  }
+
+  // La convolución CORTA de lfm3. Mismo andamio que la conv del SSM (ventana con
+  // el estado de los tokens anteriores, conv depthwise causal, guardar el
+  // estado), pero sin silu y entre dos puertas:
+  //   in_proj → [B | C | x] → B·x → conv(K) → C·y → out_proj
+  // El orden de los tres trozos es el de llama.cpp (`build_lfm_shortconv`):
+  // B primero, luego C, luego x. Cambiarlo no peta, da ruido con cara de texto.
+  async function convBlock(x, i, tokens) {
+    capaActual = i;
+    const nrm = P('attn_norm', await nn.rmsnorm(x, get(`blk.${i}.attn_norm.weight`), tokens, E, eps), tokens * E);
+    const bcx = P('in_proj', await mm(`blk.${i}.shortconv.in_proj.weight`, nrm, 3 * E, E, tokens), tokens * 3 * E);
+    const b = await slice(bcx, 0, E, tokens, 3 * E);
+    const c = await slice(bcx, E, E, tokens, 3 * E);
+    const xs = await slice(bcx, 2 * E, E, tokens, 3 * E);
+    const bx = P('bx', await attn.mul(b, xs, tokens * E), tokens * E);
+
+    const st = state.ssm.get(i);
+    const window = CK - 1 + tokens;
+    const pw = await pipe('conv_window', convWindowShader());
+    const win = ctx.alloc(E * window * 4, 'convwin');
+    const pwp = ctx.uniform([new Uint32Array([E, tokens, CK - 1, window])]);
+    await raw('conv_window', pw, [st.conv, bx, win, pwp], Math.ceil(E * window / 256));
+    const conv = P('conv', await ssmOps.conv(win, get(`blk.${i}.shortconv.conv.weight`), E, tokens, CK), tokens * E);
+    const ps = await pipe('conv_save', convSaveShader());
+    const psp = ctx.uniform([new Uint32Array([E, tokens, CK - 1, window])]);
+    await raw('conv_save', ps, [win, st.conv, psp], Math.ceil(E * (CK - 1) / 256));
+
+    const y = await attn.mul(c, conv, tokens * E);
+    const out = P('conv_out', await mm(`blk.${i}.shortconv.out_proj.weight`, y, E, E, tokens), tokens * E);
+    return await feedForward(x, out, i, tokens);
   }
 
   async function ssmBlock(x, i, tokens) {
@@ -549,8 +594,16 @@ export function createSession(model, opts = {}) {
     return await feedForward(x, out, i, tokens);
   }
 
-  async function attnBlock(x, i, tokens, posBuf) {
+  // `rope_freqs` (lfm3): un solo tensor para todas las capas globales.
+  const factoresRope = has('rope_freqs.weight') ? get('rope_freqs.weight') : null;
+
+  async function attnBlock(x, l, tokens, posBuf) {
+    const i = l.index;
     capaActual = i;
+    // Base de RoPE y ventana POR CAPA (lfm3); en el resto, las del modelo.
+    const ropeBase = l.ropeBase ?? hp.ropeFreqBase;
+    const factores = l.ropeFactores ? factoresRope : null;
+    if (l.ropeFactores && !factores) throw new Error(`la capa ${i} pide rope_freqs y el fichero no lo trae`);
     const nrm = await nn.rmsnorm(x, get(`blk.${i}.attn_norm.weight`), tokens, E, eps);
 
     // En qwen35 `attn_q` proyecta al DOBLE —Q y una puerta INTERCALADOS por
@@ -594,14 +647,14 @@ export function createSession(model, opts = {}) {
       ? await nn.rmsnorm(qRaw, get(`blk.${i}.attn_q_norm.weight`), tokens * H, D, eps)
       : qRaw;
     const q = await nn.rope(qn, posBuf,
-      { rows: tokens * H, ne0: D, heads: H, nDims: hp.ropeDims, mode: modoRope, freqBase: hp.ropeFreqBase });
+      { rows: tokens * H, ne0: D, heads: H, nDims: hp.ropeDims, mode: modoRope, freqBase: ropeBase, factores });
 
     const kRaw = await mm(`blk.${i}.attn_k.weight`, nrm, KVH * D, E, tokens);
     const kn = hp.qkNorm
       ? await nn.rmsnorm(kRaw, get(`blk.${i}.attn_k_norm.weight`), tokens * KVH, D, eps)
       : kRaw;
     const k = await nn.rope(kn, posBuf,
-      { rows: tokens * KVH, ne0: D, heads: KVH, nDims: hp.ropeDims, mode: modoRope, freqBase: hp.ropeFreqBase });
+      { rows: tokens * KVH, ne0: D, heads: KVH, nDims: hp.ropeDims, mode: modoRope, freqBase: ropeBase, factores });
     const v = await mm(`blk.${i}.attn_v.weight`, nrm, KVH * D, E, tokens);
 
     // A la caché, a partir de nPast: nunca se pisa lo ya cacheado.
@@ -618,7 +671,7 @@ export function createSession(model, opts = {}) {
     const cfg = { headDim: D, heads: H, kvHeads: KVH, tokens, nKv, nPast: state.nPast, kvF16 };
     const scores = await attn.scores(q, cache.k, cfg);
     const probs = await nn.softmax(scores,
-      { rows: H * tokens, nKv, nQ: tokens, nPast: state.nPast, scale: 1 / Math.sqrt(D) });
+      { rows: H * tokens, nKv, nQ: tokens, nPast: state.nPast, scale: 1 / Math.sqrt(D), ventana: l.ventana || 0 });
     const att = await attn.combine(probs, cache.v, cfg);
 
     // La puerta multiplica la salida ANTES de la proyección — cuando la hay.
@@ -627,6 +680,13 @@ export function createSession(model, opts = {}) {
     if (hp.qGate) {
       const gsig = await ssmOps.sigmoid(gRaw, tokens * H * D);
       gated = await attn.mul(att, gsig, tokens * H * D);
+    } else if (hp.headGate) {
+      // lfm3: un escalar por cabeza, de la ENTRADA normalizada (no de Q).
+      const gh = await mm(`blk.${i}.attn_gate.weight`, nrm, H, E, tokens);
+      const p = await pipe('mul_cabeza', mulCabezaShader());
+      gated = ctx.alloc(tokens * H * D * 4, 'gated');
+      const pp = ctx.uniform([new Uint32Array([tokens * H * D, D, 0, 0])]);
+      await raw('mul_cabeza', p, [att, gh, gated, pp], Math.ceil(tokens * H * D / 256));
     }
     const out = await mm(`blk.${i}.attn_output.weight`, gated, E, H * D, tokens);
     return await feedForward(x, out, i, tokens);
@@ -676,9 +736,9 @@ export function createSession(model, opts = {}) {
         // cuantas más capas tiene.
         const marca = ctx.scratch.length;
         const previo = x;
-        x = l.kind === 'ssm'
-          ? await ssmBlock(x, l.index, tokens)
-          : await attnBlock(x, l.index, tokens, posBuf);
+        x = l.kind === 'ssm' ? await ssmBlock(x, l.index, tokens)
+          : l.kind === 'conv' ? await convBlock(x, l.index, tokens)
+          : await attnBlock(x, l, tokens, posBuf);
         if (tap && tap.has(l.index)) taps.set(l.index, x);
         // Vivos: la salida de esta capa (entra en la siguiente), la entrada si
         // el bloque la devolvió tal cual, y cualquier tensor con sonda puesta,
@@ -696,6 +756,11 @@ export function createSession(model, opts = {}) {
         // al refresco) y va
         // limitado por reloj. Ver `cederMs`: antes iba atado al contador de capas
         // y era lo que fijaba el techo del prefill.
+        // DECODE: cortar el command buffer cada `cortaDecode` capas deja que el
+        // dispositivo empiece mientras la CPU sigue grabando el resto del token.
+        // Sin respiro (no hace falta: un token no cuelga nada). 0 = no cortar.
+        if (tokens === 1 && cortaDecode > 0 && (capaN + 1) % cortaDecode === 0 && capaN + 1 < hp.layers.length) ctx.corta();
+        if (tokens === 1) capaN++;
         if (tokens > 1) {
           const toca = (capaN + 1) % cortaCada === 0;
           // El respiro drena la cola; si el pase sigue abierto, lo que drena es

@@ -83,6 +83,27 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 
 // silu(x) = x·sigmoid(x), elemento a elemento. Se usa sobre los 6144 canales
 // justo después de la convolución, antes de cortar q|k|v.
+// Puerta POR CABEZA de lfm3: un escalar por cabeza y token que multiplica las D
+// salidas de esa cabeza. dst[t][h][d] = a[t][h][d] · sigmoid(g[t][h]). La
+// sigmoide va dentro: un despacho y un tensor intermedio menos por capa.
+export function mulCabezaShader(wg = 256) {
+  return /* wgsl */`
+const WG : u32 = ${wg}u;
+struct P { n : u32, headDim : u32, pad0 : u32, pad1 : u32 };
+@group(0) @binding(0) var<storage, read>       a   : array<f32>;   // [T][H][D]
+@group(0) @binding(1) var<storage, read>       g   : array<f32>;   // [T][H]
+@group(0) @binding(2) var<storage, read_write> dst : array<f32>;
+@group(0) @binding(3) var<uniform>             p   : P;
+
+@compute @workgroup_size(${wg})
+fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x + gid.y * 65535u * ${wg}u;   // dos ejes: uno solo topa en 65535 grupos
+  if (i >= p.n) { return; }
+  let x = g[i / p.headDim];
+  dst[i] = a[i] / (1.0 + exp(-x));
+}`;
+}
+
 export function siluShader(wg = 256) {
   return /* wgsl */`
 const WG : u32 = ${wg}u;

@@ -5,6 +5,22 @@ everything is listed under Unreleased.
 
 ## Unreleased
 
+### Added in this snapshot
+
+- The `lfm3` architecture (LFM3 1.7B): gated short convolutions, sliding-window and global attention with their own
+  rotary bases and `rope_freqs`, the per-head output gate and the norms after attention and after the feed-forward.
+  The tokenizer reads the `lfm2` pre-tokenizer, and the prompt starts with the model's start token.
+- LFM3 1.7B is the default model of the registry.
+- From 64 prompt tokens on, prompt processing multiplies `Q8_0` weights in half precision: each multiply unpacks the
+  weight into a scratch buffer and runs a matrix multiply without shared memory (`js/kernels.drift.wgsl.js`). Each
+  registry entry can also set its own prompt batch.
+- Generation submits its WebGPU work layer by layer instead of once per token.
+
+### Fixed in this snapshot
+
+- The sampler sorted the whole vocabulary on every token; it now keeps the top candidates in a heap.
+- The reply was decoded again in full on every token; it is now decoded as it streams.
+
 ### Fixed
 
 - Sampling with a temperature above zero could return the least likely candidate about half of the time, because

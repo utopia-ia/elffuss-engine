@@ -79,7 +79,12 @@ ${reduce('scratch[lid.x] + scratch[lid.x + off]')}
 // RoPE. theta_scale se calcula en el HOST: en el shader la potencia se
 // acumularía con el error de pow() y a posiciones grandes eso se nota.
 // Una fila es una cabeza de longitud ne0; solo se rotan las primeras nDims.
-export function ropeShader(wg = 64) {
+//
+// `conFactores`: lfm3 (y llama 3) traen `rope_freqs`, un divisor por par de
+// dimensiones que estira las frecuencias bajas. Va en un shader APARTE y no en
+// una rama con un buffer de unos: los modelos que no lo traen no pagan la
+// lectura, y su compilado no cambia.
+export function ropeShader(wg = 64, conFactores = false) {
   return /* wgsl */`
 const WG : u32 = ${wg}u;
 struct P {
@@ -91,6 +96,7 @@ struct P {
 @group(0) @binding(1) var<storage, read>       pos : array<i32>;
 @group(0) @binding(2) var<storage, read_write> dst : array<f32>;
 @group(0) @binding(3) var<uniform>             p   : P;
+${conFactores ? '@group(0) @binding(4) var<storage, read>       ff  : array<f32>;' : ''}
 
 @compute @workgroup_size(${wg})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -103,7 +109,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let pair = idx % pairs;
   let base = row * p.ne0;
   let token = row / p.heads;             // filas ordenadas [cabeza, token]
-  let theta = f32(pos[token]) * p.freqScale * pow(p.thetaScale, f32(pair));
+  let theta = f32(pos[token]) * p.freqScale * pow(p.thetaScale, f32(pair))${conFactores ? ' / ff[pair]' : ''};
   let c = cos(theta);
   let s = sin(theta);
 
@@ -136,11 +142,20 @@ export function softmaxShader(wg = 256) {
   return /* wgsl */`
 const WG : u32 = ${wg}u;
 const NEG_BIG : f32 = -1.0e30;
-struct P { nKv : u32, nQ : u32, nPast : u32, rows : u32, scale : f32, pad0 : f32, pad1 : f32, pad2 : f32 };
+// «ventana» > 0 es atención por VENTANA (lfm3): la clave k cuenta solo si
+// qAbs − k < ventana, la regla «estándar» de llama.cpp. A 0 es la causal de
+// siempre. Va en el uniform y no en la clave del pipeline: es la misma cuenta
+// con un límite más, y así las capas de ventana y las globales comparten
+// compilado.
+struct P { nKv : u32, nQ : u32, nPast : u32, rows : u32, scale : f32, ventana : u32, pad1 : u32, pad2 : u32 };
 @group(0) @binding(0) var<storage, read>       src : array<f32>;
 @group(0) @binding(1) var<storage, read_write> dst : array<f32>;
 @group(0) @binding(2) var<uniform>             p   : P;
 var<workgroup> scratch : array<f32, ${wg}>;
+
+fn visible(k : u32, qAbs : u32) -> bool {
+  return k <= qAbs && (p.ventana == 0u || qAbs - k < p.ventana);
+}
 
 @compute @workgroup_size(${wg})
 fn main(@builtin(workgroup_id) wid : vec3<u32>,
@@ -156,7 +171,7 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
   var acc : f32 = NEG_BIG;
   for (var it = 0u; it < iters; it = it + 1u) {
     let k = lid.x + it * WG;
-    if (k < p.nKv && k <= qAbs) { acc = max(acc, src[base + k] * p.scale); }
+    if (k < p.nKv && visible(k, qAbs)) { acc = max(acc, src[base + k] * p.scale); }
   }
 ${reduce('max(scratch[lid.x], scratch[lid.x + off])')}
   let rowMax = scratch[0];
@@ -167,7 +182,7 @@ ${reduce('max(scratch[lid.x], scratch[lid.x + off])')}
     let k = lid.x + it * WG;
     if (k < p.nKv) {
       // exp(x - max) ∈ (0,1]: imposible que desborde, en cualquier precisión.
-      let e = select(0.0, exp(src[base + k] * p.scale - rowMax), k <= qAbs);
+      let e = select(0.0, exp(src[base + k] * p.scale - rowMax), visible(k, qAbs));
       dst[base + k] = e;
       acc = acc + e;
     }

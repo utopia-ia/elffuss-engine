@@ -27,7 +27,7 @@
 // Licencia: código propio, Apache-2.0 (ver SPDX arriba y LICENSE). Sin dependencias externas.
 
 import { requestDevice, readback } from './device.js';
-import { loadModel, createSession, errorParado } from './model.js';
+import { loadModel, createSession, errorParado, _setLote } from './model.js';
 
 // Contextos a intentar, del pedido hacia abajo por mitades, con un suelo. El
 // suelo NO es cero a propósito: por debajo de 2048 el modelo no puede ni con su
@@ -50,7 +50,8 @@ import { MODELS, cachea } from './registro.js';
 
 export let name = 'Elffuss Engine · WebGPU';
 
-let clave = 'qwen35-0.8b';
+// El modelo por defecto del motor: LFM3 (ver registro.js).
+let clave = 'lfm3-1.7b';
 let ctxEfectivo = 0;   // el peldaño de la escalera en el que se abrio la sesion
 
 // ── UN SOLO MOTOR PESADO POR NAVEGADOR ──────────────────────────────────────
@@ -517,7 +518,12 @@ export async function load(onProgress = () => {}) {
       onProgress('Leyendo el índice del modelo… 0 %');
       const info = await parseGGUF(ranged);
       tk = createTokenizer(info.meta);
+      // El lote del prefill es del MODELO: 32 por defecto (el bucle recurrente
+      // del SSM corre entero dentro de un despacho y un lote largo cuelga el
+      // escritorio); el registro lo sube donde no hay ese bucle.
+      _setLote(m.lote || 32);
       pensante = /<think>/.test(String(info.meta['tokenizer.chat_template'] || ''));
+      formato = formatoDePlantilla(info.meta['tokenizer.chat_template'], tk, info.meta['general.architecture']);
 
       // La etiqueta cambia según de dónde salgan los pesos, y no es cosmética.
       // Sin caché, esta fase NO es solo «subir»: es bajar los gigabytes y
@@ -641,6 +647,7 @@ async function descargar() {
   // el error tiene que decirlo (ver «POR QUÉ se paró»).
   try { await pararTodos('descarga'); } catch { /* parar nunca impide descargar */ }
   pensante = false;
+  formato = formatoDePlantilla('', null);
   try { sesion?.destroy?.(); } catch { /* mejor esfuerzo */ }
   try {
     for (const { buf } of modelo?.weights?.values?.() || []) buf.destroy();
@@ -717,10 +724,37 @@ async function ajustaHistorial(history, presupuesto) {
 // generar, pero NO se reproduce cuando ese turno pasa a ser historia, así que
 // mientras esté dentro, lo ingerido no puede ser prefijo del prompt siguiente.
 // Medido: el desfase era de 5 tokens constantes, y son estos.
-const PENSAR = '<think>\n\n</think>\n\n';
+const PENSAR_QWEN = '<think>\n\n</think>\n\n';
 // …y el bloque ABIERTO, para cuando el modelo SÍ razona: la plantilla termina en
 // «<think>\n» y el modelo escribe su razonamiento, el «</think>» y la respuesta.
-const ABRIR = '<think>\n';
+const ABRIR_QWEN = '<think>\n';
+
+// LOS DETALLES DEL FORMATO SALEN DE LA PLANTILLA DEL FICHERO. Todas estas
+// familias son ChatML, pero no escriben igual los bordes, y un borde distinto
+// no peta: deja al modelo en un estado que no vio al entrenar.
+//   bos        LFM3 empieza por `{{- bos_token -}}` («<|startoftext|>») y no lo
+//              añade el tokenizador (add_bos_token = false): o lo pone el
+//              prompt, o no está.
+//   cerrado    «<think></think>» pegado en LFM3; con saltos de línea en Qwen.
+//   abrir      «<think>» en LFM3; «<think>\n» en Qwen.
+//   historial  LFM3 escribe «<think></think>» delante de CADA turno pasado del
+//              asistente. Además de ser lo que vio al entrenar, hace que el
+//              turno generado sin razonar y el mismo turno vuelto a escribir
+//              como historia sean IGUALES, y el prefijo se pueda reutilizar.
+//
+// ⚠️ El BOS por plantilla solo se aplica a las arquitecturas VALIDADAS con él.
+// MiniCPM5 (arch `llama`) también empieza su plantilla por `bos_token` con
+// add_bos_token = false, y hoy corre SIN su «<s>». Añadírselo cambia la salida
+// de un modelo ya ofrecido, así que se valida aparte antes de tocarlo.
+const BOS_POR_PLANTILLA = new Set(['lfm3']);
+let formato = { bos: '', cerrado: PENSAR_QWEN, abrir: ABRIR_QWEN, historial: '' };
+function formatoDePlantilla(plantilla, tok, arch = 'lfm3') {
+  const t = String(plantilla || '');
+  const f = { bos: '', cerrado: PENSAR_QWEN, abrir: ABRIR_QWEN, historial: '' };
+  if (BOS_POR_PLANTILLA.has(arch) && /^\s*\{\{-?\s*bos_token\s*-?\}\}/.test(t) && tok?.bosId !== undefined) f.bos = tok.tokenText(tok.bosId);
+  if (t.includes('"<think></think>"')) { f.cerrado = '<think></think>'; f.abrir = '<think>'; f.historial = '<think></think>'; }
+  return f;
+}
 
 // ¿Razona ESTE turno? Solo si el modelo es pensante (lo dice su plantilla) y:
 //   · `setSampling({ razonar: true|false })` lo fuerza, o
@@ -769,13 +803,14 @@ function topeRespuesta(razona) {
 // instantánea necesita saber cuántas fichas ocupa EXACTAMENTE, y escribir el
 // formato dos veces sería garantizar que algún día divergen y la foto describe
 // un punto que no es.
-function bloqueSistema(system) { return `<|im_start|>system\n${system}<|im_end|>\n`; }
+function bloqueSistema(system) { return `${formato.bos}<|im_start|>system\n${system}<|im_end|>\n`; }
 
 function montarPrompt(system, mensajes, { conPensar = true } = {}) {
   let s = bloqueSistema(system);
   for (const m of mensajes) {
     const rol = m.role === 'assistant' ? 'assistant' : 'user';
-    s += `<|im_start|>${rol}\n${m.content}<|im_end|>\n`;
+    const pre = rol === 'assistant' && formato.historial && !String(m.content).startsWith('<think>') ? formato.historial : '';
+    s += `<|im_start|>${rol}\n${pre}${m.content}<|im_end|>\n`;
   }
   s += '<|im_start|>assistant\n';
 
@@ -790,7 +825,7 @@ function montarPrompt(system, mensajes, { conPensar = true } = {}) {
   // cientos de tokens antes de la primera palabra útil, y con este modelo cada
   // token se paga caro; además el cierre suelto que emitiría hay que recortarlo
   // después. Cerrado, va directo a la respuesta.
-  if (conPensar && pensante) s += PENSAR;
+  if (conPensar && pensante) s += formato.cerrado;
   return s;
 }
 
@@ -1109,7 +1144,7 @@ async function turno(history, system, onToken, { senal, onPrefill, tLlamada }, h
   // Se puede partir así porque está comprobado que el tokenizador NO fusiona en
   // la juntura: encode(cabeza + cola) === encode(cabeza) + encode(cola), 9 de 9
   // casos en los dos modelos. Si fusionara, el punto de corte no valdría.
-  const pensar = pensante ? tk.encode(razona ? ABRIR : PENSAR) : [];
+  const pensar = pensante ? tk.encode(razona ? formato.abrir : formato.cerrado) : [];
   const armar = () => {
     const base = tk.encode(montarPrompt(system, mensajes, { conPensar: false }));
     return pensar.length
@@ -1278,6 +1313,10 @@ async function turno(history, system, onToken, { senal, onPrefill, tLlamada }, h
   const salida = [];
   hecho.salida = salida;
   let texto = '';
+  const decS = new TextDecoder('utf-8');
+  // Un tokenizador sin `bytesDe` (los de las pruebas) da sus bytes por decode.
+  const utf8 = new TextEncoder();
+  const bytesDe = tk.bytesDe ? (id) => tk.bytesDe(id) : (id) => utf8.encode(tk.decode([id]));
   // El reloj del prefill arranca AQUÍ, antes de la fase 1, y no en el bucle.
   //
   // Esto estaba mal y lo cazó una prueba interna: el prompt se parte en
@@ -1428,16 +1467,23 @@ async function turno(history, system, onToken, { senal, onPrefill, tLlamada }, h
     // Se decodifica la secuencia ENTERA y se emite la diferencia: un token puede
     // partir un carácter multibyte por la mitad, y decodificarlo suelto daría un
     // rombo de reemplazo en mitad de una palabra.
+    // EN STREAMING sobre los bytes de cada token, no redecodificando la salida
+    // entera en cada paso (cuadrático: con miles de tokens de razonamiento se
+    // notaba en la velocidad). El decodificador guarda los bytes de un carácter
+    // a medias hasta que llega el resto, así que tampoco emite rombos de
+    // reemplazo que luego hay que corregir. El texto final es el mismo que el
+    // de decodificarlo todo de una vez: así lo define el estándar.
     const tD = ahora();
-    const nuevo = tk.decode(salida);
-    if (nuevo.length > texto.length) {
-      onToken(nuevo.slice(texto.length));
-      texto = nuevo;
+    const trozo = decS.decode(bytesDe(id), { stream: true });
+    if (trozo) {
+      onToken(trozo);
+      texto += trozo;
       hecho.texto = texto;
     }
     msDecode += ahora() - tD;
     entrada = [id];
   }
+  { const fin = decS.decode(); if (fin) { onToken(fin); texto += fin; hecho.texto = texto; } }
 
   // El razonamiento se transmite EN CRUDO por onToken —la burbuja de
   // pensamiento de Elffuss está hecha para leerse— pero se limpia del texto que
@@ -1498,3 +1544,14 @@ function limpiarRazonamiento(txt) {
 // Gancho de pruebas: el respaldo mixto (almacén + red) se verifica con una
 // prueba que necesita llamar a esto directamente.
 export { rangosRepartidos as __rangosRepartidos };
+
+// Para las pruebas: el prompt que se montaría con la plantilla dada, sin cargar
+// ningún modelo. Deja el formato y `pensante` como estaban.
+export function __montarConPlantilla(plantilla, tok, system, mensajes, { razona = false, arch = 'lfm3' } = {}) {
+  const antes = [formato, pensante];
+  try {
+    formato = formatoDePlantilla(plantilla, tok, arch);
+    pensante = /<think>/.test(String(plantilla || ''));
+    return montarPrompt(system, mensajes, { conPensar: false }) + (pensante ? (razona ? formato.abrir : formato.cerrado) : '');
+  } finally { [formato, pensante] = antes; }
+}

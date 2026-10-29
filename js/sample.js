@@ -40,6 +40,41 @@ function uniforme(seed) {
   return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
 }
 
+// ¿Va `a` antes que `b`? Logit mayor primero; a igualdad, índice menor.
+const antes = (logits, a, b) => logits[a] > logits[b] || (logits[a] === logits[b] && a < b);
+
+// Los K mejores índices, ordenados. Montículo de MÍNIMOS de tamaño K (la raíz es
+// el peor de los que se guardan): cada logit nuevo solo entra si gana a la raíz.
+export function topKIndices(logits, k) {
+  const h = new Int32Array(k);
+  let size = 0;
+  const peor = (a, b) => antes(logits, b, a);          // a es «peor» que b
+  const sube = (i) => { while (i > 0) { const p = (i - 1) >> 1; if (!peor(h[i], h[p])) break; [h[i], h[p]] = [h[p], h[i]]; i = p; } };
+  const baja = (i) => {
+    for (;;) {
+      const l = 2 * i + 1, r = l + 1; let m = i;
+      if (l < size && peor(h[l], h[m])) m = l;
+      if (r < size && peor(h[r], h[m])) m = r;
+      if (m === i) return;
+      [h[i], h[m]] = [h[m], h[i]]; i = m;
+    }
+  };
+  for (let i = 0; i < logits.length; i++) {
+    if (size < k) { h[size] = i; sube(size++); }
+    else if (antes(logits, i, h[0])) { h[0] = i; baja(0); }
+  }
+  return Array.from(h.subarray(0, size)).sort((a, b) => (antes(logits, a, b) ? -1 : 1));
+}
+
+// Sin top-k: los índices a menos de `margen` del máximo, ordenados.
+function candidatos(logits, margen) {
+  let max = -Infinity;
+  for (let i = 0; i < logits.length; i++) if (logits[i] > max) max = logits[i];
+  const out = [];
+  for (let i = 0; i < logits.length; i++) if (logits[i] >= max - margen) out.push(i);
+  return out.sort((a, b) => (antes(logits, a, b) ? -1 : 1));
+}
+
 export function sample(logits, opts = {}) {
   const { temperature = 0, topP = 1, topK = 0, minP = 0, seed = 1,
           repeatPenalty = 1.1, repeatLastN = 64, presence = 0, previos = null } = opts;
@@ -64,11 +99,14 @@ export function sample(logits, opts = {}) {
     return best;
   }
 
-  // Se ordena por logit y se corta antes de exponenciar: con 248.320 entradas,
-  // hacerlo al revés cuesta un softmax completo para tirar el 99,9 %.
-  const idx = Array.from({ length: n }, (_, i) => i);
-  idx.sort((a, b) => logits[b] - logits[a]);
-  const keep = topK > 0 ? Math.min(topK, n) : n;
+  // Los candidatos ordenados por logit (desc; a igual logit, el índice menor
+  // primero, que es lo que daba la ordenación estable de antes). NO se ordena el
+  // vocabulario entero: eso eran decenas de milisegundos POR TOKEN en JS, más
+  // que el forward de un modelo pequeño. Con top-k se seleccionan los K con un
+  // montículo en una pasada; sin top-k, solo los que quedan a menos de 40 nats
+  // del máximo (fuera de ahí la probabilidad no llega a 1e-17 cada uno).
+  const idx = topK > 0 ? topKIndices(logits, Math.min(topK, n)) : candidatos(logits, 40);
+  const keep = idx.length;
 
   // top-p y min-p SIN temperatura. Resta del máximo antes de exp(): sin ella,
   // logits de 30 desbordan.

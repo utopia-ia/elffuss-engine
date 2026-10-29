@@ -68,10 +68,10 @@ fn main(@builtin(workgroup_id) wid : vec3<u32>,
 // `buf` es la ventana [3+T] por canal: los 3 primeros vienen del estado del
 // token anterior. r=0 es el más antiguo y r=3 el actual — los pesos van en
 // orden temporal directo, NO invertidos como en una convolución de libro.
-export function ssmConvShader(wg = 64) {
+export function ssmConvShader(wg = 64, k = SSM_CONV_K) {
   return /* wgsl */`
 const WG : u32 = ${wg}u;
-const K : u32 = ${SSM_CONV_K}u;
+const K : u32 = ${k}u;
 struct P { channels : u32, tokens : u32, window : u32, pad : u32 };
 @group(0) @binding(0) var<storage, read>       buf : array<f32>;   // [channels][window]
 @group(0) @binding(1) var<storage, read>       w   : array<f32>;   // [channels][K]

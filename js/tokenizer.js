@@ -80,7 +80,17 @@ const PRE_PATTERNS = {
   qwen35: CONTRACTIONS + '|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+' + TAIL.replace('%M%', '\\p{M}'),
   qwen2: CONTRACTIONS + '|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+' + TAIL.replace('%M%', ''),
 };
+// El de Llama-3, que es el que llama.cpp asigna a `lfm2` (LFM3 lo declara así):
+// aquí los números SÍ van en grupos de hasta tres cifras, `\p{N}{1,3}`.
+PRE_PATTERNS.llama3 = CONTRACTIONS + '|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+' +
+  TAIL.replace('|\\p{N}|', '|\\p{N}{1,3}|').replace('%M%', '');
+PRE_PATTERNS.lfm2 = PRE_PATTERNS.llama3;
 PRE_PATTERNS.default = PRE_PATTERNS.qwen2;
+
+// `ignore_merges` de llama.cpp: si el trozo del pre-tokenizador ENTERO ya es un
+// token, se emite tal cual sin pasar por los merges. Casi siempre da lo mismo;
+// cuando no, gana el token entero, que es como se entrenó.
+const IGNORA_MERGES = new Set(['llama3', 'llama-v3', 'llama-bpe', 'lfm2']);
 
 export function createTokenizer(meta, opts = {}) {
   const tokens = meta['tokenizer.ggml.tokens'];
@@ -96,6 +106,7 @@ export function createTokenizer(meta, opts = {}) {
   // lee como la letra «p» seguida de «{L}», falla en silencio y produce una
   // tokenización distinta que en textos cortos parece casi bien.
   const re = new RegExp(pattern, 'gu');
+  const ignoraMerges = IGNORA_MERGES.has(preName);
 
   const bosId = meta['tokenizer.ggml.bos_token_id'];
   const eosId = meta['tokenizer.ggml.eos_token_id'];
@@ -207,6 +218,10 @@ export function createTokenizer(meta, opts = {}) {
       const bytes = enc.encode(piece);
       const chars = new Array(bytes.length);
       for (let i = 0; i < bytes.length; i++) chars[i] = BYTE_TO_UNI[bytes[i]];
+      if (ignoraMerges) {
+        const entero = vocab.get(chars.join(''));
+        if (entero !== undefined) { out.push(entero); continue; }
+      }
       for (const p of bpe(chars)) {
         const id = vocab.get(p);
         if (id !== undefined) { out.push(id); continue; }
@@ -263,6 +278,19 @@ export function createTokenizer(meta, opts = {}) {
         for (const x of enc.encode(ch)) bytes[n++] = x;
       }
       return dec.decode(bytes.subarray(0, n));
+    },
+
+    // Los BYTES de un token (lo que `decode` concatena antes de pasar a UTF-8).
+    // Para decodificar en streaming sin redecodificar toda la salida en cada paso.
+    bytesDe(id) {
+      if (id < 0 || id >= tokens.length) return new Uint8Array(0);
+      const s = tokens.at(id);
+      const out = [];
+      for (const ch of s) {
+        const b = UNI_TO_BYTE.get(ch);
+        if (b !== undefined) out.push(b); else for (const x of enc.encode(ch)) out.push(x);
+      }
+      return Uint8Array.from(out);
     },
 
     // El texto de UN token, para emitir en streaming. Ojo: un token puede

@@ -62,8 +62,10 @@ export function createState(device, hp, opts = {}) {
       kv.set(l.index, { k: buf(per, `k${l.index}`), v: buf(per, `v${l.index}`) });
       bytes += per * 2;
     } else {
-      // Un estado de S_k x S_v por cabeza de VALOR, no de clave.
-      const st = hp.ssmVHeads * hp.ssmState * hp.ssmState * 4;
+      // Un estado de S_k x S_v por cabeza de VALOR, no de clave. La convolución
+      // corta de lfm3 no tiene estado aparte de su ventana: se deja un buffer
+      // mínimo para que instantáneas y reset traten las dos igual.
+      const st = l.kind === 'conv' ? 16 : hp.ssmVHeads * hp.ssmState * hp.ssmState * 4;
       const cv = (hp.convKernel - 1) * hp.convChannels * 4;
       ssm.set(l.index, { state: buf(st, `s${l.index}`), conv: buf(cv, `c${l.index}`) });
       bytes += st + cv;
@@ -263,11 +265,27 @@ export function createState(device, hp, opts = {}) {
 //             degrada al crecer el contexto, que es la peor forma de fallar.
 //   ffnNorm   se llama `post_attention_norm` en qwen35 y `ffn_norm` en llama.
 //
+// `lfm3` (LiquidAI) es otra híbrida, pero su bloque recurrente NO es el SSM de
+// qwen35: es una CONVOLUCIÓN CORTA con puerta (in_proj → B·x → conv de 7 →
+// C·y → out_proj), sin estado más allá de la ventana de la convolución. Y trae
+// cuatro cosas que las otras dos no:
+//   headGate  la puerta de la atención es UN escalar por cabeza, de su propio
+//             tensor (`attn_gate`, E→H) con sigmoide; no va intercalada en Q.
+//   postNorms normas «sándwich»: otra RMSNorm sobre la salida del bloque y otra
+//             sobre la del FFN, antes de sumar al residual. ⚠️ Aquí
+//             `post_attention_norm` ES una post-norma, no la norma del FFN como
+//             en qwen35: mismo nombre de tensor, otro papel.
+//   ventanas  unas capas de atención miran solo los últimos `sliding_window`
+//             tokens y con otra base de RoPE; las globales usan `rope_freqs`.
+//   conv      el bloque no-atención es la convolución corta.
+//
 // Los nombres NO se deducen mirando si el tensor existe. Con `has(...)`, un
 // modelo al que le faltara el tensor dejaría de fallar y empezaría a mentir.
 const ARQUITECTURAS = {
   qwen35: { qGate: true,  qkNorm: true,  ropeMode: 'neox', ffnNorm: 'post_attention_norm', hibrida: true },
   llama:  { qGate: false, qkNorm: false, ropeMode: 'norm', ffnNorm: 'ffn_norm',            hibrida: false },
+  lfm3:   { qGate: false, qkNorm: true,  ropeMode: 'neox', ffnNorm: 'ffn_norm',            hibrida: true,
+            headGate: true, postNorms: true, conv: true },
 };
 
 export function readHParams(meta, tensors = null) {
@@ -295,7 +313,18 @@ export function readHParams(meta, tensors = null) {
   const nLayers = nLayersFichero - nextn;
   const interval = g('full_attention_interval', 4);
   const heads = g('attention.head_count');
-  const kvHeads = g('attention.head_count_kv');
+  // En lfm3 `head_count_kv` es una LISTA por capa: 0 en las de convolución y
+  // las cabezas KV en las de atención. Todas las de atención llevan las mismas
+  // (se comprueba): el resto del motor trabaja con un único número.
+  const kvLista = g('attention.head_count_kv');
+  let kvHeads = kvLista;
+  // El lector de GGUF puede devolver la lista como array TIPADO: Array.isArray
+  // no lo ve y el número de cabezas quedaba siendo un array (NaN en la KV).
+  if (Array.isArray(kvLista) || ArrayBuffer.isView(kvLista)) {
+    const distintas = [...new Set([...kvLista].map(Number).filter(n => n > 0))];
+    if (distintas.length !== 1) throw new Error(`cabezas KV distintas por capa: ${distintas.join(', ')}`);
+    kvHeads = distintas[0];
+  }
   const embd = g('embedding_length');
   // head_dim NO es embd/heads en este modelo: 1024/8 = 128, pero el head_dim
   // real es 256. Sale de su propia clave.
@@ -315,9 +344,23 @@ export function readHParams(meta, tensors = null) {
     ? attnSet.has(i)
     : (i + 1) % interval === 0;
 
+  // lfm3: ventana y base de RoPE POR CAPA. Las de ventana usan `freq_base_swa`
+  // y no `rope_freqs`; las globales, la base normal y los factores.
+  const patronSwa = perfil.conv ? g('attention.sliding_window_pattern') : null;
+  const nSwa = perfil.conv ? g('attention.sliding_window') : 0;
+  const baseGlobal = g('rope.freq_base', 1e7);
+  const baseSwa = perfil.conv ? g('rope.freq_base_swa') : baseGlobal;
+
   const layers = [];
   for (let i = 0; i < nLayers; i++) {
-    layers.push({ index: i, kind: esAtencion(i) ? 'attn' : 'ssm' });
+    if (!esAtencion(i)) { layers.push({ index: i, kind: perfil.conv ? 'conv' : 'ssm' }); continue; }
+    const swa = !!(patronSwa && patronSwa[i]);
+    layers.push({
+      index: i, kind: 'attn',
+      ventana: swa ? nSwa : 0,
+      ropeBase: swa ? baseSwa : baseGlobal,
+      ropeFactores: !!perfil.conv && !swa,
+    });
   }
 
   // DOS recuentos distintos, y confundirlos rompe solo los modelos grandes:
@@ -353,12 +396,14 @@ export function readHParams(meta, tensors = null) {
     ropeDims: g('rope.dimension_count', 64),
     eps: meta[`${arch}.attention.layer_norm_rms_epsilon`] ?? 1e-6,
     ssmHeads, ssmVHeads, ssmState, ssmInner,
-    convKernel: g('ssm.conv_kernel', 4),
+    // lfm3: la convolución corta va sobre el embedding entero y su kernel es
+    // `shortconv.l_cache` (7). En qwen35 son los canales del qkv fusionado.
+    convKernel: perfil.conv ? g('shortconv.l_cache') : g('ssm.conv_kernel', 4),
     // conv_dim = 2·key_dim + value_dim, con key_dim = grupos·estado y
     // value_dim = inner. En el 0.8B los dos valen 2048 y da 6144; en el 27B el
     // value_dim son 6144 y da 10240.
-    convChannels: 2 * ssmHeads * ssmState + ssmInner,
+    convChannels: perfil.conv ? embd : 2 * ssmHeads * ssmState + ssmInner,
     nAttn: layers.filter(l => l.kind === 'attn').length,
-    nSSM: layers.filter(l => l.kind === 'ssm').length,
+    nSSM: layers.filter(l => l.kind !== 'attn').length,
   };
 }
