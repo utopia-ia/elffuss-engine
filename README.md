@@ -83,8 +83,12 @@ This exact page is the one we ran, in headless Chrome, against this tree served 
   the Elffuss apps, which is why the quick start selects the Qwen model instead.
 - `models()` also lists two larger models that are hosted for the Elffuss apps. They, and the copy of LFM3 the
   registry points at, are not meant to be loaded from other sites.
-- Weight types the engine reads: `F32`, `F16`, `BF16`, `Q8_0`, `Q2_K`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ1_S`, `IQ2_XXS`,
-  and two third-party ternary formats, `PQ2_0` and `PTQ1_0`.
+- Weight types the engine reads: `F32`, `F16`, `BF16`, `Q8_0`, `Q4_0`, `Q2_K`, `Q4_K`, `Q5_K`, `Q6_K`, `IQ1_S`,
+  `IQ2_XXS`, and two third-party ternary formats, `PQ2_0` and `PTQ1_0`.
+- Faster paths for LFM3. When the GGUF header names the `lfm3` architecture, the engine turns on faster code paths
+  for prompt processing and generation before it loads the weights (see the [changelog](CHANGELOG.md)). Other
+  architectures keep the previous paths. To keep the previous paths for LFM3 too, set
+  `globalThis.__ELFFUSS_RAPIDO = false` before `load()`.
 
 Other GGUF files may fail to load, or load and answer worse without an error: the engine has three architecture
 profiles (`qwen35`, `llama` and `lfm3`), reads only the `gpt2` tokenizer family, and always writes a ChatML prompt
@@ -115,7 +119,7 @@ reasons, how its turns are closed and, for `lfm3`, the start token.
 ## Layout
 
 ```
-js/         the runtime: 20 ES modules, served as they are written
+js/         the runtime: 33 ES modules, served as they are written
             provider.js    the chat API of the quick start
             registro.js    the model registry; it imports nothing, so a page can list models without the engine
             gguf.js        the GGUF reader, which reads by byte ranges
@@ -123,8 +127,9 @@ js/         the runtime: 20 ES modules, served as they are written
             sample.js      the sampler
             model.js       a model session on WebGPU
             device.js      the WebGPU device
-            the rest       the shaders (kernels.*.wgsl.js) and what runs them (ops.js, state.js, hadamard.js,
-                           quant-tables.js)
+            repack.js      reorders Q8_0 and Q4_0 weights at load, for the faster paths
+            the rest       the shaders (kernels.*.wgsl.js) and what runs them (ops.js and ops.*.js, state.js,
+                           hadamard.js, topk.js, quant-tables.js)
 assets/     the logo
 ```
 

@@ -35,6 +35,9 @@
 //
 // Licencia: código propio, Apache-2.0 (ver SPDX arriba y LICENSE). Sin dependencias externas.
 
+// Lectura de bloques del formato REORDENADO al cargar (Q8_0R/Q4_0R, `__ELFFUSS_REPACK`).
+import { bloquesWGSL } from './kernels.bloques.wgsl.js';
+
 export const Q8_BLOCK = 32;
 export const Q8_BLOCK_BYTES = 34;
 
@@ -161,6 +164,27 @@ ${emit('1u', 'bitcast<f32>(par & 0xFFFF0000u)')}`,
         let q = load_u32_at(blk + 2u + i * 4u);
         for (var c = 0u; c < 4u; c = c + 1u) {
 ${emit('i * 4u + c', 'f32(get_byte_i32(q, c)) * d')}
+        }
+      }`,
+  },
+
+  // 32 pesos, 18 bytes: escala f16 + 16 bytes de nibbles. El nibble BAJO del
+  // byte j es el peso j y el ALTO el peso j+16 (no los dos seguidos), y el valor
+  // es (q − 8)·d. LFM3 se publica así (QAD-Q4_0), con los embeddings en Q6_K.
+  // 18·i es par: la escala nunca cruza palabra; los nibbles sí, y por eso van
+  // por load_u32_at.
+  Q4_0: {
+    blockElems: 32,
+    blockBytes: 18,
+    helpers: '',
+    decode: (emit) => /* wgsl */`
+      let d = load_scale(blk);
+      for (var i = 0u; i < 4u; i = i + 1u) {
+        let q = load_u32_at(blk + 2u + i * 4u);
+        for (var c = 0u; c < 4u; c = c + 1u) {
+          let by = (q >> (c * 8u)) & 0xFFu;
+${emit('i * 4u + c', 'f32(i32(by & 0xFu) - 8) * d')}
+${emit('i * 4u + c + 16u', 'f32(i32(by >> 4u) - 8) * d')}
         }
       }`,
   },
@@ -794,6 +818,65 @@ ${lazo}`;
             let gv = f32(get_byte_i32(gw, j & 3u));
 ${emit('obase + j', 'dl * (gv + delta)')}
           }
+        }
+      }`,
+  },
+
+  // ── Q8_0 y Q4_0 REORDENADOS al cargar (`__ELFFUSS_REPACK`) ────────────────
+  // Tipos internos, nunca en un GGUF: el cargador los pone cuando reordena
+  // (repack.js) y el formato está en `kernels.bloques.wgsl.js`. Los mismos bytes
+  // que Q8_0/Q4_0 en otro orden: los cuantos de cada bloque alineados y las
+  // escalas todas juntas al final.
+  //
+  // Cada uno es una COPIA de su descodificador del GGUF con las dos lecturas
+  // cambiadas, y nada más: `load_scale(blk)` pasa a `bq_escala(bi)` y la palabra
+  // de cuantos que salía de `load_u32_at` (dos lecturas y un select, porque el
+  // bloque arranca a media palabra la mitad de las veces) pasa a `bq_palabra`,
+  // una lectura alineada. Son los mismos 32 bits y el mismo f32 de escala, y la
+  // expresión de cada peso y el orden en que se emiten son carácter por
+  // carácter los del original: el andamio acumula exactamente lo mismo y la
+  // salida tiene que ser idéntica BIT A BIT a la del tipo de origen. Así se
+  // valida, no con tolerancia.
+  //
+  // `blk` lo sigue calculando el andamio como si el formato fuera el del GGUF
+  // —(fila·bpr + b)·34—, así que aquí se divide por el tamaño del bloque para
+  // recuperar su índice. Es una división por constante por bloque de 32 pesos,
+  // y deja sin tocar el direccionamiento de los tres andamios de aquí (matmul,
+  // dequant y gather). El GEMM en teselas y la descuantización drift tienen su
+  // propia tabla por tipo (`TIRADAS`, `CUATRO`) y llevan allí su entrada R.
+  //
+  // `blockBytes` es lo que ocupa un bloque DE MEDIA (cuantos más su escala), no
+  // la zancada: los bloques R no van seguidos. Sirve para contar bytes de un
+  // tensor entero, NO para cortarlo por filas (fila·bpr·blockBytes cae en
+  // cuantos de otra fila y deja sus escalas atrás).
+  Q8_0R: {
+    blockElems: Q8_BLOCK,
+    blockBytes: Q8_BLOCK_BYTES,     // 34 de media: los cuantos más su escala
+    helpers: bloquesWGSL('Q8_0R'),
+    decode: (emit) => /* wgsl */`
+      let bi = blk / ${Q8_BLOCK_BYTES}u;
+      let d = bq_escala(bi);
+      for (var i = 0u; i < 8u; i = i + 1u) {
+        let q = bq_palabra(bi, i);
+        for (var c = 0u; c < 4u; c = c + 1u) {
+${emit('i * 4u + c', 'f32(get_byte_i32(q, c)) * d')}
+        }
+      }`,
+  },
+
+  Q4_0R: {
+    blockElems: 32,
+    blockBytes: 18,                 // de media, como en Q8_0R: no es una zancada
+    helpers: bloquesWGSL('Q4_0R'),
+    decode: (emit) => /* wgsl */`
+      let bi = blk / 18u;
+      let d = bq_escala(bi);
+      for (var i = 0u; i < 4u; i = i + 1u) {
+        let q = bq_palabra(bi, i);
+        for (var c = 0u; c < 4u; c = c + 1u) {
+          let by = (q >> (c * 8u)) & 0xFFu;
+${emit('i * 4u + c', 'f32(i32(by & 0xFu) - 8) * d')}
+${emit('i * 4u + c + 16u', 'f32(i32(by >> 4u) - 8) * d')}
         }
       }`,
   },

@@ -121,6 +121,22 @@ const TIRADAS = {
           ${escribe('i + c', 'f32(i32((by >> (c * 2u)) & 3u) - 1) * d')}
         }
       }`,
+
+  // Q8_0 REORDENADO al cargar (`__ELFFUSS_REPACK`, kernels.bloques.wgsl.js):
+  // la tirada de Q8_0 de arriba con las dos lecturas cambiadas. `blk` sale como
+  // si el formato fuera el del GGUF y se divide por 34 para tener el índice del
+  // bloque; los cuatro bytes que empiezan en e0+i son la palabra (e0+i)/4 de sus
+  // cuantos (e0 e i son múltiplos de 4). Mismos bits, mismo valor escrito en la
+  // tesela: el GEMM no cambia ni un bit. Q4_0R no está, igual que Q4_0.
+  Q8_0R: ({ n, escribe }) => /* wgsl */`
+      let bi = blk / 34u;
+      let d = bq_escala(bi);
+      for (var i = 0u; i < ${n}u; i = i + 4u) {
+        let q = bq_palabra(bi, (e0 + i) / 4u);
+        for (var c = 0u; c < 4u; c = c + 1u) {
+          ${escribe('i + c', 'f32(get_byte_i32(q, c)) * d')}
+        }
+      }`,
 };
 
 // Qué tipos saben pasar por aquí. La lista SON las claves de `TIRADAS`: tener
@@ -153,12 +169,15 @@ export function soportaGemm(type, k, TK = 0) {
  * forma que no cabe con un mensaje que diga cuánto pedía, en vez de que reviente
  * la validación de WebGPU al crear el pipeline con un texto genérico.
  */
-export function matmulGemmShader(type, { TM = 4, TN = 4, WGM = 8, WGN = 8, TK = 0, maxCompartida = 32768 } = {}) {
-  const d = quantInfo(type);
-  if (!TIPOS_GEMM.has(type)) {
+export function matmulGemmShader(type, { TM = 4, TN = 4, WGM = 8, WGN = 8, TK = 0, maxCompartida = 32768, extra = null } = {}) {
+  // `extra` (interruptor GEMM2_Q4, ver kernels.gemm2.wgsl.js): un tipo que NO
+  // está en TIRADAS trae su descriptor de bloque y su tirada. Sin él, todo
+  // sigue exactamente igual que antes.
+  const d = extra ? extra.info : quantInfo(type);
+  if (!TIPOS_GEMM.has(type) && !extra) {
     throw new Error(`matmulGemmShader: «${type}» todavía no pasa por el GEMM (ver TIRADAS)`);
   }
-  const tk = tkPara(type, TK);
+  const tk = extra ? ((TK | 0) || Math.min(TK_POR_DEFECTO, d.blockElems)) : tkPara(type, TK);
   if (tk % 4 !== 0) {
     throw new Error(`matmulGemmShader: TK=${tk} tiene que ser múltiplo de 4 (las tiradas leen de 4 en 4)`);
   }
@@ -351,7 +370,7 @@ export function matmulGemmShader(type, { TM = 4, TN = 4, WGM = 8, WGN = 8, TK = 
   }
   const VOLCADO = V.join('\n');
 
-  const tirada = TIRADAS[type]({
+  const tirada = (extra ? extra.tirada : TIRADAS[type])({
     n: POR_HILO_W,
     escribe: (i, v) => `ws[fila * ${SW}u + kk0 + ${i}] = ${v};`,
   });

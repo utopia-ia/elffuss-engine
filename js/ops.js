@@ -30,9 +30,13 @@ import {
 // cache, y es por lo que el oraculo X_FIJA mide que traer `x` es el termino mayor
 // del matmul. Con N filas por workgroup ese trafico se divide entre N.
 import { matmulFilasShader, filasPorGrupo } from './kernels.filas.wgsl.js';
+// GEMV del decode de segunda generación, detrás de `__ELFFUSS_GEMV2`.
+import { createGemvOps } from './ops.gemv.js';
 import { matmulGemmShader, soportaGemm, tkPara, TIPOS_GEMM } from './kernels.gemm.wgsl.js';
 import { hadamardShader } from './kernels.hadamard.wgsl.js';
-import { q8aDriftShader, f32aF16Shader, driftGemmShader, DRIFT_TPW, DRIFT_TPT } from './kernels.drift.wgsl.js';
+import { driftDequantShader, DRIFT_TIPOS, f32aF16Shader, driftGemmShader, DRIFT_TPW, DRIFT_TPT } from './kernels.drift.wgsl.js';
+// GEMM del prompt con la descuantización dentro (interruptor __ELFFUSS_GEMM2).
+import { createGemm2Ops } from './ops.gemm2.js';
 import {
   rmsnormShader, ropeShader, softmaxShader, swigluShader, addShader,
   ROPE_NORM, ROPE_NEOX,
@@ -46,6 +50,10 @@ import {
   attnCombineSplitShader, combineReduceShader, bloquesCombine,
   attnScoresSharedShader, compartidaScores,
 } from './kernels.attn.wgsl.js';
+// Q8_0/Q4_0 reordenados al cargar (`__ELFFUSS_REPACK`): antes de despachar un
+// lector R, que el buffer sea el que el lector espera (ver repack.js).
+import { TIPOS_R } from './kernels.bloques.wgsl.js';
+import { compruebaBufferR } from './repack.js';
 
 export { ROPE_NORM, ROPE_NEOX, SSM_HEAD_DIM, SSM_CONV_K };
 
@@ -134,6 +142,22 @@ function createContext(device, opts = {}) {
     scratch: [],
     scratchFree: new Map(),           // tamaño → [buffers]
   };
+  // Estado del PLAN (`__ELFFUSS_PLAN`, ver `abreLotePlan`). ctx._plan se fija
+  // al abrir cada lote y vuelve a false al cerrarlo: fuera de un lote todo va
+  // por el camino de siempre. `planStats` lo leen las pruebas.
+  ctx._plan = false;
+  ctx._ranura = 0;
+  ctx._ranuras = [];
+  ctx._bg = new WeakMap();
+  ctx._bgN = 0;
+  ctx._layouts = new WeakMap();
+  ctx._memoLote = null;
+  ctx._nPozo = 0;
+  // Lo más grande que puede medir un buffer del pozo que se enlaza entero (ver
+  // `tallaGruesa`). Sin límites declarados (algún doble de pruebas), sin tope.
+  ctx._topeTalla = Math.min(device.limits?.maxBufferSize ?? Infinity,
+    device.limits?.maxStorageBufferBindingSize ?? Infinity);
+  ctx.planStats = { bindGroups: 0, bindGroupsReusados: 0, escrituras: 0, escriturasAhorradas: 0 };
 
   // `code` puede ser el WGSL o una FUNCIÓN que lo construya. La diferencia no es
   // de estilo: con la cadena, el argumento se evalúa ANTES de entrar aquí, así
@@ -142,7 +166,7 @@ function createContext(device, opts = {}) {
   // tirarlo acto seguido. Con la función, el WGSL solo se arma cuando de verdad
   // hay que compilarlo. Se admiten las dos formas: hay llamadas que ya traen la
   // cadena hecha y no tiene sentido envolverlas.
-  ctx.pipeline = async function (key, code) {
+  const compila = async function (key, code) {
     if (cache.has(key)) return cache.get(key);
     const p = await guard(device, 'compilar ' + key, async () => {
       const module = device.createShaderModule({ label: key, code: typeof code === 'function' ? code() : code });
@@ -158,6 +182,13 @@ function createContext(device, opts = {}) {
     cache.set(key, p);
     return p;
   };
+  // Con PLAN y el pipeline ya compilado se devuelve TAL CUAL, sin envolverlo en
+  // una promesa: quien llama hace `await` igual y se ahorra la promesa y la
+  // función asíncrona por despacho. Sin PLAN, exactamente lo de siempre.
+  ctx.pipeline = function (key, code) {
+    if (ctx._plan) { const p = cache.get(key); if (p !== undefined) return p; }
+    return compila(key, code);
+  };
 
   // Solo DIAGNOSTICO: las claves de pipeline ya compiladas. Existe porque el modo
   // de fallo mas caro de este repo es que dos ramas de un A/B compartan pipeline
@@ -171,6 +202,7 @@ function createContext(device, opts = {}) {
   // así que la segunda escritura pisaría a la primera antes de que el
   // dispositivo ejecute ninguna de las dos. Se reciclan entre lotes, no dentro.
   ctx.uniform = function (arrays) {
+    if (ctx.pass !== null && ctx._plan) return uniformePlan(ctx, arrays);
     const bytes = arrays.reduce((n, a) => n + a.byteLength, 0);
     const size = Math.max(16, Math.ceil(bytes / 16) * 16);
     let buf = ctx.uniformFree.pop();
@@ -206,7 +238,7 @@ function createContext(device, opts = {}) {
   let reparto = 0;
   ctx.marcaDe = new WeakMap();
   ctx.alloc = function (bytes, label) {
-    const size = Math.max(4, Math.ceil(bytes / 256) * 256);
+    const size = ctx._plan && TALLA_GRUESA.has(label) ? tallaGruesa(bytes, ctx._topeTalla) : Math.max(4, Math.ceil(bytes / 256) * 256);
     const free = ctx.scratchFree.get(size);
     let buf = free && free.pop();
     if (!buf) buf = device.createBuffer({ label, size, usage: storageUsage() });
@@ -227,6 +259,7 @@ function createContext(device, opts = {}) {
     }
     ctx.scratch = [];
     ctx.vivosBytes = 0;
+    if (globalThis.__ELFFUSS_PLAN === true) ordenaPozo(ctx);
   };
 
   // Devuelve al pozo lo prestado A PARTIR de una marca, salvo los buffers que
@@ -263,6 +296,7 @@ function createContext(device, opts = {}) {
     if (ctx.profile) return await fn();       // perfilando: cada despacho lleva su propio pass
     if (ctx.debug) { device.pushErrorScope('validation'); }
     ctx._label = label;
+    abreLotePlan(ctx);
     ctx._enc = device.createCommandEncoder({ label });
     ctx.pass = ctx._enc.beginComputePass(ctx._descPase(label));
     let out;
@@ -271,6 +305,8 @@ function createContext(device, opts = {}) {
       ctx.pass = null;
       device.queue.submit([ctx._enc.finish()]);
       ctx._enc = null;
+      ctx._plan = false;
+      ctx._memoLote = null;
     }
     if (ctx.debug) {
       const err = await device.popErrorScope();
@@ -414,9 +450,201 @@ function createContext(device, opts = {}) {
   return ctx;
 }
 
+// ── PLAN: lo que se repite token a token se prepara una vez ────────────────
+// (`__ELFFUSS_PLAN`). Un token de generación graba los mismos ~550 despachos
+// sobre los mismos pesos, normas, caché y estado, y sobre los mismos
+// intermedios si el pozo los entrega en el mismo orden. Aun así cada despacho
+// pagaba un `getBindGroupLayout` nuevo, un `createBindGroup` nuevo y una
+// escritura de uniformes, aunque fueran los mismos bytes que en el token
+// anterior. Tres piezas, las tres solo DENTRO de un lote (`ctx.batch`), que es
+// donde el orden de las operaciones se repite:
+//   · RANURAS DE UNIFORMES: la n-ésima llamada a `ctx.uniform` del lote usa
+//     siempre el mismo buffer y solo se escribe si sus bytes cambian (en
+//     generación, las posiciones y nKv de la atención). Sigue siendo un buffer
+//     por operación dentro del lote, que es lo que evita la carrera de dos
+//     escrituras antes del mismo envío. Entre lotes la escritura va ordenada
+//     en la cola DETRÁS de lo ya enviado: el token anterior, aunque siga en
+//     vuelo, lee lo suyo.
+//   · CACHÉ DE BIND GROUPS por (pipeline, buffers), con el layout de cada
+//     pipeline pedido una sola vez.
+//   · POZO EN ORDEN CANÓNICO: al reciclar se ordena cada lista de libres. Así
+//     cada token empieza con el mismo pozo y pide los mismos buffers en el
+//     mismo orden; sin eso el reparto se permuta de un token a otro y la caché
+//     de bind groups acertaría solo a ratos.
+// Nada de esto toca shaders ni despachos: los mismos pipelines, la misma
+// rejilla y los mismos bytes en cada uniforme. Cambia QUÉ buffer físico sale
+// del pozo, y la numérica no depende de eso. Supone que los interruptores no
+// cambian A MITAD de un lote (se cambian entre forwards).
+function abreLotePlan(ctx) {
+  ctx._plan = globalThis.__ELFFUSS_PLAN === true;
+  ctx._ranura = 0;
+  ctx._memoLote = ctx._plan ? new Map() : null;
+}
+
+// Tope de bind groups guardados. Un prefill con un último lote de largo nuevo
+// crea los suyos; sin tope, una sesión larga los acumularía sin fin.
+const BG_TOPE = 1 << 15;
+
+// Los intermedios de la atención que CRECEN con el contexto (puntuaciones,
+// probabilidades, parciales de la combinación). Con tallas de 256 B el de las
+// puntuaciones cambia de talla cada pocos tokens: buffer nuevo, bind groups
+// nuevos, y el viejo se queda en el pozo para siempre (el pozo no suelta
+// nada), así que lo muerto crece con el CUADRADO del contexto. Con PLAN estos
+// tres van en escalones geométricos de 1/8 de octava (como mucho un 12,5 % de
+// holgura): la talla cambia cada vez menos a menudo y lo que queda muerto está
+// acotado. Solo estos tres porque nadie lee su `.size` (los consumen los
+// kernels de la atención, que no miran la longitud del buffer); un buffer que
+// sale a quien llama, como los logits, conserva su talla exacta.
+// LA REGLA de la que depende la exactitud: se enlazan ENTEROS, así que el
+// shader ve un buffer más largo que sin PLAN. Da lo mismo mientras ningún
+// kernel que los lea use `arrayLength` ni lea más allá de lo pedido (hoy todos
+// acotan con nKv o con el número de bloques). Un kernel nuevo que lea uno de
+// estos tiene que cumplirla, o su etiqueta tiene que salir de aquí. Una prueba
+// sin dispositivo revisa el WGSL de todo pipeline que enlaza uno de ellos en
+// los modelos de juguete.
+const TALLA_GRUESA = new Set(['scores', 'softmax.out', 'attn.parc']);
+// `tope`: lo más grande que admite el dispositivo para un buffer que se enlaza
+// entero (el menor de `maxBufferSize` y `maxStorageBufferBindingSize`). El
+// escalón nunca pasa de la siguiente potencia de dos, así que con límites que
+// lo son, si cabe la talla exacta cabe el escalón. Pero hay límites que NO son
+// potencia de dos, y con ellos una talla que cabe podría subir a un escalón
+// que no: buffer o bind group inválidos y, sin ámbito de error, unos logits
+// equivocados sin un aviso. Ahí va la talla exacta, como sin PLAN.
+function tallaGruesa(bytes, tope = Infinity) {
+  const b = Math.max(256, Math.ceil(bytes / 256) * 256);
+  if (b <= 4096) return b;
+  const e = (b < 2 ** 31 ? 31 - Math.clz32(b) : Math.floor(Math.log2(b))) - 3;   // b ∈ [8·2^e, 16·2^e)
+  const paso = 2 ** e;
+  const g = Math.ceil(b / paso) * paso;
+  return g <= tope ? g : b;
+}
+
+function despachaPlan(ctx, pipe, buffers, x, y, z) {
+  const st = ctx.planStats;
+  if (ctx._bgN >= BG_TOPE) { ctx._bg = new WeakMap(); ctx._bgN = 0; }
+  // Un árbol de WeakMaps: pipeline → buffer 0 → buffer 1 → … → bind group. Sin
+  // claves de texto que armar en cada despacho, y lo que deje de existir se va
+  // solo.
+  let nodo = ctx._bg.get(pipe);
+  if (nodo === undefined) { nodo = { m: null, bg: null }; ctx._bg.set(pipe, nodo); }
+  for (let i = 0; i < buffers.length; i++) {
+    if (nodo.m === null) nodo.m = new WeakMap();
+    let h = nodo.m.get(buffers[i]);
+    if (h === undefined) { h = { m: null, bg: null }; nodo.m.set(buffers[i], h); }
+    nodo = h;
+  }
+  let bg = nodo.bg;
+  if (bg === null) {
+    let layout = ctx._layouts.get(pipe);
+    if (layout === undefined) { layout = pipe.getBindGroupLayout(0); ctx._layouts.set(pipe, layout); }
+    bg = ctx.device.createBindGroup({
+      layout, entries: buffers.map((buffer, binding) => ({ binding, resource: { buffer } })),
+    });
+    nodo.bg = bg;
+    ctx._bgN++;
+    st.bindGroups++;
+  } else {
+    st.bindGroupsReusados++;
+  }
+  const pass = ctx.pass;
+  pass.setPipeline(pipe);
+  pass.setBindGroup(0, bg);
+  pass.dispatchWorkgroups(x, y, z);
+}
+
+// La ranura de uniformes de esta llamada. Se compara con lo que la ranura YA
+// tiene (una copia en CPU de lo último escrito) y solo se escribe si cambia.
+function uniformePlan(ctx, arrays) {
+  const device = ctx.device, st = ctx.planStats;
+  const i = ctx._ranura++;
+  let bytes = 0;
+  for (let j = 0; j < arrays.length; j++) bytes += arrays[j].byteLength;
+  const size = Math.max(16, Math.ceil(bytes / 16) * 16);
+  let r = ctx._ranuras[i];
+  if (r === undefined || r.buf.size < size) {
+    if (r !== undefined) r.buf.destroy();
+    const cap = Math.max(size, 64);
+    const sombra = new ArrayBuffer(cap);
+    r = {
+      buf: device.createBuffer({
+        label: 'params', size: cap, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      }),
+      u32: new Uint32Array(sombra), i32: new Int32Array(sombra), f32: new Float32Array(sombra),
+      bytes: -1,                       // -1: lo que hay en el buffer no se sabe
+    };
+    ctx._ranuras[i] = r;
+  }
+  if (r.bytes === bytes && mismosBytes(r, arrays)) {
+    st.escriturasAhorradas += arrays.length;
+    return r.buf;
+  }
+  // Cambió: a la sombra y al dispositivo de UNA vez (los mismos bytes que
+  // escribían las llamadas sueltas, en los mismos sitios).
+  let off = 0, sabido = true;
+  for (let j = 0; j < arrays.length && sabido; j++) {
+    sabido = copiaSombra(r, off >> 2, arrays[j]);
+    off += arrays[j].byteLength;
+  }
+  if (sabido) {
+    device.queue.writeBuffer(r.buf, 0, r.u32, 0, bytes >> 2);
+    r.bytes = bytes;
+    st.escrituras++;
+  } else {
+    off = 0;
+    for (let j = 0; j < arrays.length; j++) { device.queue.writeBuffer(r.buf, off, arrays[j]); off += arrays[j].byteLength; }
+    r.bytes = -1;
+    st.escrituras += arrays.length;
+  }
+  return r.buf;
+}
+
+// ¿Son los mismos BITS? Para f32, Object.is distingue −0 de +0; un NaN se da
+// por distinto y se reescribe. Un tipo que no se conoce, también.
+function mismosBytes(r, arrays) {
+  let w = 0;
+  for (let j = 0; j < arrays.length; j++) {
+    const a = arrays[j], n = a.length;
+    if (a instanceof Uint32Array) {
+      for (let q = 0; q < n; q++) if (r.u32[w + q] !== a[q]) return false;
+    } else if (a instanceof Int32Array) {
+      for (let q = 0; q < n; q++) if (r.i32[w + q] !== a[q]) return false;
+    } else if (a instanceof Float32Array) {
+      for (let q = 0; q < n; q++) { const v = a[q]; if (v !== v || !Object.is(r.f32[w + q], v)) return false; }
+    } else {
+      return false;
+    }
+    w += n;
+  }
+  return true;
+}
+
+function copiaSombra(r, w, a) {
+  if (a instanceof Uint32Array) r.u32.set(a, w);
+  else if (a instanceof Int32Array) r.i32.set(a, w);
+  else if (a instanceof Float32Array) r.f32.set(a, w);
+  else return false;
+  return true;
+}
+
+// Orden canónico del pozo: por el orden en que cada buffer se vio por primera
+// vez. Cualquier orden FIJO sirve; lo que importa es que no dependa del token.
+function ordenaPozo(ctx) {
+  const ids = ctx._idPozo || (ctx._idPozo = new WeakMap());
+  const id = (b) => {
+    let v = ids.get(b);
+    if (v === undefined) { v = ++ctx._nPozo; ids.set(b, v); }
+    return v;
+  };
+  for (const lista of ctx.scratchFree.values()) {
+    for (const b of lista) id(b);
+    if (lista.length > 1) lista.sort((a, b) => ids.get(a) - ids.get(b));
+  }
+}
+
 // Graba un despacho. Dentro de un lote solo apunta; fuera, abre y cierra su
 // propio encoder para que las llamadas sueltas de los tests sigan funcionando.
 async function dispatch(ctx, label, pipe, buffers, x, y = 1, z = 1) {
+  if (ctx.pass !== null && ctx._plan) { despachaPlan(ctx, pipe, buffers, x, y, z); return; }
   const device = ctx.device;
   const record = (pass) => {
     const bg = device.createBindGroup({
@@ -503,6 +731,17 @@ export function createQuantOps(device, opts = {}) {
   const sgSize = opts.subgroupSize || 0;
   const ctx = opts.ctx || createContext(device, opts);
   const get = ctx.pipeline;
+  // GEMV nuevos del decode (`__ELFFUSS_GEMV2`, apagado por defecto). Comparten
+  // contexto y despachador con todo lo demás; ver ops.gemv.js.
+  const gemv = createGemvOps(device, { ctx, subgroupSize: sgSize,
+    despacha: (label, pipe, bufs, x, y, z) => dispatch(ctx, label, pipe, bufs, x, y, z),
+    // La comprobación de los búferes reordenados (`compruebaBufferR`, de
+    // repack.js) se le pasa si este fichero la importa: así el GEMV nuevo acepta
+    // exactamente los búferes que acepta el camino de siempre. `typeof` deja
+    // nombrarla sin que el import exista todavía.
+    compruebaR: typeof compruebaBufferR === 'function' ? compruebaBufferR : null });
+  // Solo cierra sobre el contexto: crearlo no despacha nada ni reserva búferes.
+  const gemm2 = createGemm2Ops(ctx, { dispatch, dispatchXYZ, dispatchN });
 
   const info = (type) => {
     const i = QUANT_TYPES[type];
@@ -517,7 +756,9 @@ export function createQuantOps(device, opts = {}) {
   // Q8_0 se queda clavado en su tamaño de siempre a propósito: es el kernel del
   // bucle de decode y está medido así. Cambiarlo sin volver a medirlo sería
   // adivinar.
-  const threadsFor = (type, bpr) => type === 'Q8_0'
+  // Q8_0R (Q8_0 reordenado al cargar) va con Q8_0: el mismo ancho reparte
+  // la suma igual, y sin eso dejaría de ser idéntico bit a bit a su origen.
+  const threadsFor = (type, bpr) => (type === 'Q8_0' || type === 'Q8_0R')
     ? wgQ8
     : Math.min(64, Math.max(4, 2 ** Math.ceil(Math.log2(Math.max(1, bpr)))));
 
@@ -550,6 +791,7 @@ export function createQuantOps(device, opts = {}) {
     // es donde se caza una descodificación mal hecha.
     async dequant(type, wBuf, nBlocks) {
       const i = info(type);
+      if (TIPOS_R.has(type)) compruebaBufferR(type, wBuf, { bloques: nBlocks }, 'dequant');
       const p = await get(`dequant_${type}`, () => dequantShader(type, wgQ8));
       const out = ctx.alloc(nBlocks * i.blockElems * 4, 'dequant.out');
       const params = ctx.uniform([new Uint32Array([nBlocks, 0, 0, 0])]);
@@ -562,6 +804,27 @@ export function createQuantOps(device, opts = {}) {
     // Y = A·X con A cuantizada y X token-major (k contiguo por token).
     // `tokens = 1` es el matvec del decode; más es el prefill.
     async matmul(type, wBuf, xBuf, rows, k, tokens = 1) {
+      // GEMV nuevos (`__ELFFUSS_GEMV2`), de 1 a 3 tokens. Si no aplican al tipo,
+      // a la forma o al dispositivo devuelven null y sigue el camino de siempre.
+      const yGemv2 = globalThis.__ELFFUSS_GEMV2 === true && tokens <= 3
+        ? await gemv.matmul(type, wBuf, xBuf, rows, k, tokens) : null;
+      if (yGemv2) return yGemv2;
+      // GEMV2 y GEMM2 se reparten tokens disjuntos: GEMV2 solo de 1 a 3 (arriba);
+      // GEMM2 desde DRIFT_DESDE (64 por defecto) o, con GEMM2_Q4, desde 4 (ver
+      // `planGemm2`). Solo se pisarían si alguien baja DRIFT_DESDE a mano por
+      // debajo de 4; entonces manda GEMV2, que es lo que ya pasaba con DRIFT
+      // (GEMV2 va antes que el resto de caminos de `matmul`).
+      // ── GEMM2 (ops.gemm2.js), APAGADO por defecto ──────────────────────────
+      // Va antes de todo porque también lee los tipos reordenados al cargar
+      // (Q8_0R, Q4_0R). Devuelve null cuando la forma no le toca, y entonces se
+      // sigue exactamente por el camino de siempre. Como va antes de la
+      // comprobación de los reordenados de aquí abajo, hace la suya
+      // (`compruebaBufferR`, la misma) y saca de la marca dónde empiezan las
+      // escalas: nunca del filas·bpr de la llamada.
+      if (globalThis.__ELFFUSS_GEMM2 === true) {
+        const y2 = await gemm2.matmul(type, wBuf, xBuf, rows, k, tokens);
+        if (y2) return y2;
+      }
       const i = info(type);
       if (k % i.blockElems !== 0) {
         throw new Error(`matmul ${type}: k=${k} no es múltiplo de ${i.blockElems}`);
@@ -573,6 +836,9 @@ export function createQuantOps(device, opts = {}) {
         ? Math.max(1, Math.min(32, (globalThis.__ELFFUSS_TILE | 0) || TILE_PREFILL))
         : 1;
       const bpr = k / i.blockElems;
+      // Reordenados: el buffer tiene que llevar la marca de su tensor y la
+      // llamada no puede salirse de él. Vale para los tres caminos de abajo.
+      if (TIPOS_R.has(type)) compruebaBufferR(type, wBuf, { bloques: rows * bpr }, 'matmul');
 
       // ── Camino GEMM: una tesela en memoria compartida y el acumulador en
       // registros. Es un sustituto del camino de abajo con el MISMO contrato de
@@ -608,13 +874,13 @@ export function createQuantOps(device, opts = {}) {
       // memoria compartida. Desde DRIFT_DESDE tokens: por debajo el grupo de 64
       // tokens queda medio vacío y la descuantización no se amortiza.
       const DRIFT_DESDE = globalThis.__ELFFUSS_DRIFT_DESDE || 64;
-      if (tokens >= DRIFT_DESDE && type === 'Q8_0' && globalThis.__ELFFUSS_DRIFT !== false &&
+      if (tokens >= DRIFT_DESDE && DRIFT_TIPOS.has(type) && globalThis.__ELFFUSS_DRIFT !== false &&
           device.features.has('shader-f16') && rows % 16 === 0 && k % 4 === 0) {
         const ks4 = k / 4;
-        const pq = await get('drift_q8', () => q8aDriftShader(256));
+        const pq = await get(`drift_deq_${type}`, () => driftDequantShader(type, 256));
         const wh = ctx.alloc(rows * k * 2, 'drift.w');
         const totalW = rows * ks4;
-        await dispatchN(ctx, `drift_q8:r${rows}`, pq,
+        await dispatchN(ctx, `drift_deq:${type}:r${rows}`, pq,
           [wBuf, wh, ctx.uniform([new Uint32Array([rows, k, bpr, totalW])])], Math.ceil(totalW / 256));
         const px = await get('drift_x16', () => f32aF16Shader(256));
         const xh = ctx.alloc(tokens * k * 2, 'drift.x');
@@ -762,7 +1028,13 @@ export function createQuantOps(device, opts = {}) {
       // interruptor se reutilizaria el pipeline ya compilado y las dos ramas
       // medirian el mismo shader.
       const filas = filasPorGrupo(type, wg, tile, carril, rows, subgroup);
-      const p = await get(`matmul_${type}_${wg}_${tile}_${subgroup ? 'sg' : 'tr'}` +
+      // PLAN: dentro de un lote la clave de abajo (una docena de interruptores
+      // leídos y concatenados) se arma UNA vez por forma; la memoria se tira al
+      // cerrar el lote, así que un interruptor cambiado entre forwards se ve.
+      const memoMM = ctx._memoLote;
+      const claveMM = memoMM !== null ? `${type}|${wg}|${tile}|${subgroup}|${carril}|${filas}|${rows}|${k}|${tokens}` : '';
+      const pMemo = memoMM !== null ? memoMM.get(claveMM) : undefined;
+      const p = pMemo || await get(`matmul_${type}_${wg}_${tile}_${subgroup ? 'sg' : 'tr'}` +
         (globalThis.__ELFFUSS_GUARDA_POR_PESO ? '_g' : '') + (carril ? '_c' : '') +
         (globalThis.__ELFFUSS_X_FIJA ? '_x0' : '') + (globalThis.__ELFFUSS_W_FIJA ? '_w0' : '') + (globalThis.__ELFFUSS_DESENROLLA ? '_u' : '') + (globalThis.__ELFFUSS_DEQ_PLANA ? '_dp' : '') + (globalThis.__ELFFUSS_X_VEC4 !== false ? '_v4' : '') +
         // El izado de cargas TIENE que entrar en la clave. Sin esto, al conmutar
@@ -781,6 +1053,7 @@ export function createQuantOps(device, opts = {}) {
         (filas > 1 ? `_f${filas}` : ''),
         () => (filas > 1 ? matmulFilasShader(type, filas, sgSize)
                          : matmulShader(type, wg, tile, subgroup, sgSize, carril)));
+      if (memoMM !== null && pMemo === undefined) memoMM.set(claveMM, p);
       const y = ctx.alloc(rows * tokens * 4, 'matmul.y');
       const params = ctx.uniform([new Uint32Array([rows * bpr, bpr, rows, k, tokens, 0, 0, 0])]);
       const bufs = [wBuf, xBuf, y, params];
@@ -812,6 +1085,7 @@ export function createQuantOps(device, opts = {}) {
       if (dim % i.blockElems !== 0) {
         throw new Error(`gather ${type}: dim=${dim} no es múltiplo de ${i.blockElems}`);
       }
+      if (TIPOS_R.has(type)) compruebaBufferR(type, wBuf, { porFila: dim / i.blockElems }, 'gather');
       const p = await get(`gather_${type}`, () => gatherShader(type, wgQ8));
       const bpr = dim / i.blockElems;
       const dst = ctx.alloc(tokens * dim * 4, 'embd');
@@ -837,6 +1111,12 @@ export function createQuantOps(device, opts = {}) {
       return buf;
     },
     ctx,
+    // Las variantes fusionadas (gate+up con SwiGLU, Q/K/V/puerta) las llama el
+    // modelo directamente; solo se usan con `__ELFFUSS_GEMV2`.
+    gemv,
+    // La cola de la última capa (model.js, interruptor GEMM2_COLA) y el plan
+    // para diagnóstico. No lo usa nada con los interruptores apagados.
+    gemm2,
   };
 }
 

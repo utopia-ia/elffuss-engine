@@ -18,21 +18,60 @@
 //
 // Licencia: código propio, Apache-2.0 (ver SPDX arriba y LICENSE). Sin dependencias externas.
 import { HELPERS } from './kernels.wgsl.js';
+import { bloquesWGSL } from './kernels.bloques.wgsl.js';
 
 export const DRIFT_TPW = 32;   // hilos por grupo, todos en tokens
 export const DRIFT_TPT = 2;    // tokens por hilo
 export const DRIFT_FILAS = 16; // filas de salida por hilo
 
-// Q8_0 [rows][K] (bloques de 34 bytes) → f16 [rows/16][K/4][16] vec4.
-// Un hilo por vec4 de salida.
-export function q8aDriftShader(wg = 256) {
+// Pesos cuantizados [rows][K] → f16 [rows/16][K/4][16] vec4. Un hilo por vec4
+// de salida: cuatro pesos CONSECUTIVOS en k de una fila. Cada tipo dice cómo
+// sacar esos cuatro de su bloque (todos son de 32 pesos y kk es múltiplo de 4,
+// así que nunca cruzan de bloque).
+// Q8_0R/Q4_0R son los mismos tipos REORDENADOS al cargar (`__ELFFUSS_REPACK`,
+// ver kernels.bloques.wgsl.js).
+export const DRIFT_TIPOS = new Set(['Q8_0', 'Q4_0', 'Q8_0R', 'Q4_0R']);
+const CUATRO = {
+  // 34 bytes: escala f16 + 32 int8.
+  Q8_0: { bytes: 34, wgsl: `
+  let d = load_scale(blk);
+  let q = load_u32_at(blk + 2u + i0);
+  let v = vec4<f32>(f32(get_byte_i32(q, 0u)), f32(get_byte_i32(q, 1u)), f32(get_byte_i32(q, 2u)), f32(get_byte_i32(q, 3u))) * d;` },
+  // 18 bytes: escala f16 + 16 bytes de nibbles; byte j = peso j (bajo) y j+16 (alto).
+  Q4_0: { bytes: 18, wgsl: `
+  let d = load_scale(blk);
+  let q = load_u32_at(blk + 2u + (i0 & 15u));
+  let sh = select(0u, 4u, i0 >= 16u);
+  let v = (vec4<f32>(f32((q >> sh) & 0xFu), f32((q >> (8u + sh)) & 0xFu), f32((q >> (16u + sh)) & 0xFu), f32((q >> (24u + sh)) & 0xFu)) - 8.0) * d;` },
+  // Los reordenados: las MISMAS dos expresiones de arriba con las lecturas
+  // cambiadas. `blk` sigue saliendo como si el formato fuera el del GGUF y se
+  // divide por el tamaño del bloque para tener su índice; la escala y la palabra
+  // de cuantos son los mismos bits, así que el f16 que se escribe también. Se
+  // llama `bi` y no `i` porque aquí se está en el cuerpo de `main`, donde `i`
+  // ya es el índice del hilo.
+  Q8_0R: { bytes: 34, helpers: bloquesWGSL('Q8_0R'), wgsl: `
+  let bi = blk / 34u;
+  let d = bq_escala(bi);
+  let q = bq_palabra(bi, i0 / 4u);
+  let v = vec4<f32>(f32(get_byte_i32(q, 0u)), f32(get_byte_i32(q, 1u)), f32(get_byte_i32(q, 2u)), f32(get_byte_i32(q, 3u))) * d;` },
+  Q4_0R: { bytes: 18, helpers: bloquesWGSL('Q4_0R'), wgsl: `
+  let bi = blk / 18u;
+  let d = bq_escala(bi);
+  let q = bq_palabra(bi, (i0 & 15u) / 4u);
+  let sh = select(0u, 4u, i0 >= 16u);
+  let v = (vec4<f32>(f32((q >> sh) & 0xFu), f32((q >> (8u + sh)) & 0xFu), f32((q >> (16u + sh)) & 0xFu), f32((q >> (24u + sh)) & 0xFu)) - 8.0) * d;` },
+};
+
+export function driftDequantShader(type, wg = 256) {
+  const c = CUATRO[type];
+  if (!c) throw new Error(`drift: sin descuantización para ${type}`);
   return /* wgsl */`
 enable f16;
 struct P { rows : u32, k : u32, bpr : u32, total : u32 };
 @group(0) @binding(0) var<storage, read>       w   : array<u32>;
 @group(0) @binding(1) var<storage, read_write> dst : array<vec4<f16>>;
 @group(0) @binding(2) var<uniform>             p   : P;
-${HELPERS}
+${HELPERS}${c.helpers || ''}
 @compute @workgroup_size(${wg})
 fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x + gid.y * 65535u * ${wg}u;
@@ -43,11 +82,9 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let og = i / (16u * ks4);
   let row = og * 16u + j;
   let kk = ks * 4u;
-  let blk = (row * p.bpr + kk / 32u) * 34u;
-  let d = load_scale(blk);
-  let q = load_u32_at(blk + 2u + (kk % 32u));
-  dst[i] = vec4<f16>(f16(f32(get_byte_i32(q, 0u)) * d), f16(f32(get_byte_i32(q, 1u)) * d),
-                     f16(f32(get_byte_i32(q, 2u)) * d), f16(f32(get_byte_i32(q, 3u)) * d));
+  let blk = (row * p.bpr + kk / 32u) * ${c.bytes}u;
+  let i0 = kk % 32u;${c.wgsl}
+  dst[i] = vec4<f16>(v);
 }`;
 }
 

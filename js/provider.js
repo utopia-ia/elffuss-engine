@@ -50,6 +50,43 @@ import { MODELS, cachea } from './registro.js';
 
 export let name = 'Elffuss Engine · WebGPU';
 
+// ── Los interruptores «rápido», ENCENDIDOS POR DEFECTO solo para LFM3 ───────
+// El motor lee cada uno con `=== true`: sin poner, apagado. Eso NO se cambia en
+// js/: las pruebas de encendido contra apagado dependen de que «sin poner» sea
+// apagado, y darle la vuelta allí las dejaría comparando encendido contra
+// encendido sin avisar. El defecto se pone AQUÍ, en el producto, donde la
+// arquitectura se conoce por la cabecera antes de cargar los pesos (REPACK
+// actúa al cargar: tiene que estar puesto antes de `loadModel`).
+// Solo LFM3: es lo validado en el dispositivo con todos puestos (oráculos de llama.cpp
+// en Q8_0 y QAD-Q4_0) y donde ganan, en prompt y en generación. Los demás
+// modelos (27B, Bonsai, …) no están validados con ellos y siguen como antes.
+// PLAN y TOPK_GPU no entran (no ganaron), ni los subinterruptores de GEMM2.
+// Reglas:
+//   · Lo que la página puso (true O false) antes de decidir aquí, manda: solo
+//     se pone lo que no está puesto.
+//   · Se apunta qué puso el proveedor; al descargar (y cambiar de modelo en la
+//     misma página, que Code permite, pasa por descargar) y al cargar otro
+//     modelo se quitan SOLO esos, y solo si siguen en true (un false puesto
+//     luego por la página se respeta). Uno que la página ponga a true DESPUÉS
+//     de cargar LFM3 no se distingue de uno puesto aquí: para fijarlo en todos
+//     los modelos, ponerlo antes de cargar.
+//   · Interruptor de corte: `__ELFFUSS_RAPIDO === false` no pone ninguno.
+export const RAPIDO_LFM3 = Object.freeze(['__ELFFUSS_GEMV2', '__ELFFUSS_GEMM2', '__ELFFUSS_GEMM2_COLA',
+  '__ELFFUSS_FLASH', '__ELFFUSS_FUSION', '__ELFFUSS_REPACK']);
+const puestosRapido = new Set();
+export function aplicaRapido(arch, g = globalThis) {
+  for (const k of puestosRapido) if (g[k] === true) delete g[k];
+  puestosRapido.clear();
+  if (arch !== 'lfm3' || g.__ELFFUSS_RAPIDO === false) return [];
+  for (const k of RAPIDO_LFM3) {
+    if (g[k] !== undefined) continue;                  // la página manda
+    g[k] = true;
+    puestosRapido.add(k);
+  }
+  return [...puestosRapido];
+}
+export function __rapidoPuestos() { return [...puestosRapido]; }
+
 // El modelo por defecto del motor: LFM3 (ver registro.js).
 let clave = 'lfm3-1.7b';
 let ctxEfectivo = 0;   // el peldaño de la escalera en el que se abrio la sesion
@@ -517,6 +554,10 @@ export async function load(onProgress = () => {}) {
       // progreso REAL durante la subida, que es la parte larga.
       onProgress('Leyendo el índice del modelo… 0 %');
       const info = await parseGGUF(ranged);
+      // Los interruptores «rápido» de esta arquitectura, ANTES de cargar los
+      // pesos (ver `aplicaRapido`); y fuera los que se pusieron para otra.
+      const rapido = aplicaRapido(info.meta['general.architecture']);
+      if (rapido.length) console.info(`[engine] interruptores rápidos por defecto: ${rapido.join(' ')}`);
       tk = createTokenizer(info.meta);
       // El lote del prefill es del MODELO: 32 por defecto (el bucle recurrente
       // del SSM corre entero dentro de un despacho y un lote largo cuelga el
@@ -669,6 +710,10 @@ async function descargar() {
   // sobreviva a esto apunta a memoria liberada.
   consumidos = null;
   sistemaFoto = null;
+  // Y los interruptores «rápido» que puso este proveedor: solo valen mientras
+  // él tenga cargado un LFM3 (ver `aplicaRapido`). Lo que se cargue después a
+  // mano en la misma página (una prueba, otro motor) no los hereda.
+  aplicaRapido(null);
 }
 
 // {temperature, seed, p, k, maxTokens} o null para volver a voraz. Lo usa el
@@ -1427,18 +1472,49 @@ async function turno(history, system, onToken, { senal, onPrefill, tLlamada }, h
     // 248.320 de CADA token del prompt —la cabeza entera, una vez por token— y
     // se descartaban todos menos los del último.
     const tR = ahora(); msForward += tR - tF;
-    const todos = new Float32Array(await readback(gpu.device, logits, 0, logitsTokens * vocab * 4));
-    if (senal.aborted) throw errorParado();
-    const ultimo = todos.subarray((logitsTokens - 1) * vocab, logitsTokens * vocab);
-    const tS = ahora(); msReadback += tS - tR;
-    // Con los tokens ya emitidos, para que la penalización de repetición pueda
-    // actuar. Sin ellos, el muestreador no sabe que se está repitiendo.
-    // La semilla CAMBIA en cada token (como en generate()): con la misma en
-    // todos, cada paso sacaba el mismo cuantil de su distribución y no había azar.
-    const mu = muestreoEfectivo() || { temperature: 0 };   // (`m` es la medida del turno)
-    const id = sample(ultimo, { ...mu, seed: (mu.seed || 1) + paso,
-                                previos: ids.concat(salida) });
-    msSample += ahora() - tS;
+    // `__ELFFUSS_TOPK_GPU`: el dispositivo elige los candidatos que `sample()`
+    // necesita y solo se leen esos (ver ops.topk.js); mismo token, bit a bit.
+    // Si este muestreo no tiene tope, los kernels avisan de algo o algo lanza,
+    // `id` se queda sin poner y se lee el vector entero por el camino de
+    // siempre. El módulo se importa solo si el interruptor está puesto:
+    // apagado, nada cambia ni se carga.
+    let id;
+    const mod = modelo;
+    if (globalThis.__ELFFUSS_TOPK_GPU === true && mod?.ops && !mod.__topkRoto) {
+      const mu = muestreoEfectivo() || { temperature: 0 };
+      try {
+        mod.__topk ??= (await import('./ops.topk.js')).createTopKGPU(gpu.device, mod.ops.ctx);
+        const r = await mod.__topk.muestrea(logits, (logitsTokens - 1) * vocab, vocab,
+          { ...mu, seed: (mu.seed || 1) + paso }, ids, salida);
+        if (r) { id = r.id; msReadback += r.msLectura; msSample += r.msMuestreo; }
+      } catch (e) {
+        // Lo que LANZA tampoco tumba el turno: un módulo que falta en esta
+        // copia del motor, o una lectura que falla. Se apaga para este modelo,
+        // se avisa una vez y el token sale por el camino de siempre, que, si el
+        // dispositivo se ha perdido, lanzará como antes. (`mod` y no `modelo`:
+        // la pérdida del dispositivo lo anula mientras se espera.) Si además
+        // se pidió parar, gana el «para»: este fallo no es de los que tumban el
+        // turno, así que no se enseña como si lo fuera.
+        if (senal.aborted) throw errorParado();
+        mod.__topkRoto = true;
+        console.warn(`[engine] top-k en el dispositivo desactivado: ${e?.message || e}`);
+      }
+      if (senal.aborted) throw errorParado();
+    }
+    if (id === undefined) {
+      const todos = new Float32Array(await readback(gpu.device, logits, 0, logitsTokens * vocab * 4));
+      if (senal.aborted) throw errorParado();
+      const ultimo = todos.subarray((logitsTokens - 1) * vocab, logitsTokens * vocab);
+      const tS = ahora(); msReadback += tS - tR;
+      // Con los tokens ya emitidos, para que la penalización de repetición pueda
+      // actuar. Sin ellos, el muestreador no sabe que se está repitiendo.
+      // La semilla CAMBIA en cada token (como en generate()): con la misma en
+      // todos, cada paso sacaba el mismo cuantil de su distribución y no había azar.
+      const mu = muestreoEfectivo() || { temperature: 0 };   // (`m` es la medida del turno)
+      id = sample(ultimo, { ...mu, seed: (mu.seed || 1) + paso,
+                            previos: ids.concat(salida) });
+      msSample += ahora() - tS;
+    }
     sesion.recycle();
 
     // Frontera prefill/generación: el primer paso ha metido `procesados` tokens

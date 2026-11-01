@@ -165,6 +165,12 @@ export async function guard(device, label, fn) {
 export async function readback(device, src, offset = 0, size = src.size - offset) {
   if (offset % 8) throw new Error('readback: el offset debe ser múltiplo de 8 (mapAsync)');
   if (size % 4) throw new Error('readback: el tamaño debe ser múltiplo de 4');
+  // (Salvo si redondear la talla del buffer de lectura pasara de `maxBufferSize`:
+  // ahí, el de siempre, que lo pide exacto.)
+  if (globalThis.__ELFFUSS_PLAN === true &&
+      Math.max(256, Math.ceil(size / 256) * 256) <= (device.limits?.maxBufferSize ?? Infinity)) {
+    return await lecturaPersistente(device, src, offset, size);
+  }
 
   // MAP_READ solo puede combinarse con COPY_DST. Añadir STORAGE o COPY_SRC deja
   // el buffer inválido — y devolviendo ceros, cómo no.
@@ -189,6 +195,87 @@ export async function readback(device, src, offset = 0, size = src.size - offset
     return copy;
   } finally {
     staging.destroy();
+  }
+}
+
+// La misma lectura con PLAN (`__ELFFUSS_PLAN`): el bucle de generación lee en
+// cada token, y cada lectura creaba y destruía su buffer y pagaba tres idas y
+// vueltas de ámbitos de error. Aquí los buffers de lectura se GUARDAN, dos por
+// tamaño y turnándose (mientras uno está mapeado el otro está libre), y los
+// ámbitos de error se quedan donde un fallo de configuración se descubre: la
+// primera vez que se usa cada buffer, o si la copia pedida no se puede hacer.
+// Una copia inválida sin ámbito no lanza: dejaría en el buffer lo de la lectura
+// anterior. Por eso lo que sí se puede comprobar en CPU se comprueba antes, y
+// si no cuadra se va por el camino con ámbitos. Lo único que no se puede mirar
+// desde la CPU es un origen YA DESTRUIDO: el camino de siempre lanzaría y este
+// devolvería datos viejos. Los logits salen del pozo, que no destruye nada.
+// `ocupado` marca cada buffer desde que se elige hasta que se desmapea. El
+// estado de mapeo NO basta: solo cambia al llamar a mapAsync, y entre la copia
+// y esa llamada está la espera del ámbito de la primera vez. Tres lecturas a la
+// vez del mismo tamaño elegían así el mismo buffer, y la tercera copia pisaba
+// la de la primera antes de que esta lo mapeara.
+const pozosLectura = new WeakMap();      // device → Map(tamaño → { bufs, validado, ocupado, turno })
+const CLASES_LECTURA = 8;
+
+async function lecturaPersistente(device, src, offset, size) {
+  let pozo = pozosLectura.get(device);
+  if (!pozo) { pozo = new Map(); pozosLectura.set(device, pozo); }
+  const clase = Math.max(256, Math.ceil(size / 256) * 256);
+  let e = pozo.get(clase);
+  if (!e) {
+    // Con demasiados tamaños distintos (un banco que lee de todo) se suelta la
+    // clase más vieja que no esté en uso.
+    if (pozo.size >= CLASES_LECTURA) {
+      for (const [c, v] of pozo) {
+        if (!v.ocupado[0] && !v.ocupado[1]) {
+          for (const b of v.bufs) b?.destroy();
+          pozo.delete(c);
+          break;
+        }
+      }
+    }
+    e = { bufs: [null, null], validado: [false, false], ocupado: [false, false], turno: 0 };
+    pozo.set(clase, e);
+  }
+  let k = e.turno; e.turno ^= 1;
+  if (e.ocupado[k]) k ^= 1;
+  let staging, temporal = false;
+  if (e.ocupado[k]) {
+    // Las dos ocupadas (lecturas concurrentes): una de usar y tirar.
+    staging = device.createBuffer({ label: 'readback', size: clase,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    temporal = true;
+  } else {
+    if (!e.bufs[k] || e.bufs[k].mapState !== 'unmapped') {
+      e.bufs[k] = device.createBuffer({ label: 'readback', size: clase,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      e.validado[k] = false;
+    }
+    staging = e.bufs[k];
+    e.ocupado[k] = true;
+  }
+  const copia = () => {
+    const enc = device.createCommandEncoder({ label: 'readback' });
+    enc.copyBufferToBuffer(src, offset, staging, 0, size);
+    device.queue.submit([enc.finish()]);
+  };
+  const cuadra = typeof src.usage === 'number' && (src.usage & GPUBufferUsage.COPY_SRC) !== 0 &&
+    offset + size <= src.size;
+  try {
+    if (temporal || !e.validado[k] || !cuadra) await guard(device, 'readback/copy', async () => copia());
+    else copia();
+    await staging.mapAsync(GPUMapMode.READ, 0, size);
+    const copy = staging.getMappedRange(0, size).slice(0);
+    staging.unmap();
+    if (!temporal) e.validado[k] = true;
+    return copy;
+  } catch (err) {
+    // Tras un fallo no se sabe en qué estado queda el buffer: fuera.
+    if (!temporal) { try { staging.destroy(); } catch { /* — */ } e.bufs[k] = null; e.validado[k] = false; }
+    throw err;
+  } finally {
+    if (temporal) staging.destroy();
+    else e.ocupado[k] = false;
   }
 }
 
