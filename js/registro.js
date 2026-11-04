@@ -48,6 +48,26 @@ export const MODELS = {
     licencia: 'https://m1.elffuss.com/lfm3-1.7b.LICENSE.txt',
   },
 
+  // El mismo LFM3 en el QAD-Q4_0 de LiquidAI (entrenado para esa cuantización),
+  // para el MÓVIL. El Q8_0 no cabe ahí: la pestaña de un teléfono muere antes
+  // de sostenerlo, y este pesa poco más de la mitad. Con los interruptores
+  // rápidos genera más deprisa que el Q8_0 y pasa los mismos oráculos de
+  // llama.cpp. Contexto 8k y no 32k: la KV crece con el contexto y, a 32k,
+  // pesos y KV juntos se pasan del presupuesto del teléfono; a 8k es la cuarta parte.
+  //
+  // Se lee de Hugging Face fijado a una revisión (no `main`), sin redistribuirlo.
+  'lfm3-1.7b-q4': {
+    label: 'LFM3 1.7B · Q4_0',
+    url: 'https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/bad5729bba61d076fff20d2548e62526665af215/LFM3-1.7B-QAD-Q4_0.gguf',
+    bytes: 1049615680,
+    ctx: 8192,
+    razona: true,
+    presupuesto: 4000,
+    muestreo: { temperature: 0.1, topP: 1, topK: 50, minP: 0, presence: 0, repeatPenalty: 1.1 },
+    lote: 512,
+    licencia: 'https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/blob/bad5729bba61d076fff20d2548e62526665af215/LICENSE',
+  },
+
   // MiniCPM5-2B en Q8_0.
   //
   // Entra sin tocar el motor porque su GGUF declara `general.architecture =

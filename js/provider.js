@@ -1044,6 +1044,11 @@ async function pararTodos(causa) {
  * silencio. Romper esa llamada para estrenar un parámetro sería cambiar el
  * contrato por comodidad mía.
  */
+// `opts.reserveTokens`: tokens that the caller will place in the prompt on top
+// of the history (the memory block of the turn). They are subtracted from the
+// history budget before the history is fitted. Integer, default 0.
+const reservaDe = (x) => (Number.isFinite(x) && x > 0 ? Math.floor(x) : 0);
+
 export async function chat(history, system, onToken = () => {}, opts = {}) {
   const o = opts && typeof opts.aborted === 'boolean' ? { signal: opts } : (opts || {});
   const onPrefill = typeof o.onPrefill === 'function' ? o.onPrefill : null;
@@ -1071,7 +1076,7 @@ export async function chat(history, system, onToken = () => {}, opts = {}) {
         (parado.porDescarga ? ' · por descarga' : ''));
       throw parado;
     }
-    return await turnoParable(history, system, onToken, { senal: ctl.signal, onPrefill, tLlamada });
+    return await turnoParable(history, system, onToken, { senal: ctl.signal, onPrefill, tLlamada, reserva: reservaDe(o.reserveTokens) });
   } finally {
     turnosVivos.delete(ctl);
     externa?.removeEventListener?.('abort', reenviar);
@@ -1114,7 +1119,7 @@ async function turnoParable(history, system, onToken, opciones) {
   }
 }
 
-async function turno(history, system, onToken, { senal, onPrefill, tLlamada }, hecho) {
+async function turno(history, system, onToken, { senal, onPrefill, tLlamada, reserva = 0 }, hecho) {
   // Un turno parado antes de empezar no toca nada: ni el estado ni la foto.
   if (senal.aborted) throw errorParado();
   // Uno que llegó con una descarga en marcha la espera: cuando le toque, el
@@ -1179,7 +1184,9 @@ async function turno(history, system, onToken, { senal, onPrefill, tLlamada }, h
     throw new Error(`las instrucciones ocupan ${sistema} tokens y este modelo solo tiene ` +
       `${ctxLen} de contexto: elige un modelo con más contexto para trabajar con herramientas.`);
   }
-  const mensajes = await ajustaHistorial(history, ctxLen - sistema - RESERVA);
+  // `reserveTokens` (el bloque de memoria del turno, por ejemplo) se descuenta
+  // del presupuesto de la historia ANTES de ajustarla.
+  const mensajes = await ajustaHistorial(history, Math.max(0, ctxLen - sistema - RESERVA - reserva));
   if (senal.aborted) throw errorParado();
   // El prompt se arma en DOS PIEZAS. `cabeza` es todo hasta el punto donde se
   // fotografía el estado; `cola` es lo que se alimenta después y queda FUERA de
