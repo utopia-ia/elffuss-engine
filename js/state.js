@@ -96,6 +96,13 @@ export function createState(device, hp, opts = {}) {
   // así dos ranuras no llegan al 5 % de lo que pesan sus pesos; se cambian por
   // no reprocesar el prompt de sistema en cada turno.
   const ranuras = new Map();
+  const creaSombra = (r, nombre) => {
+    if (r.sombra) return;
+    r.sombra = new Map();
+    for (const [i, { state: s, conv }] of ssm) {
+      r.sombra.set(i, { state: buf(s.size, `snap-${nombre}-s${i}`), conv: buf(conv.size, `snap-${nombre}-c${i}`) });
+    }
+  };
   const ranura = (nombre) => {
     let r = ranuras.get(nombre);
     if (!r) { r = { sombra: null, past: -1 }; ranuras.set(nombre, r); }
@@ -160,12 +167,7 @@ export function createState(device, hp, opts = {}) {
     // tokens cuesta exactamente lo mismo que una de 10.
     instantanea(nombre = 'turno') {
       const r = ranura(nombre);
-      if (!r.sombra) {
-        r.sombra = new Map();
-        for (const [i, { state: s, conv }] of ssm) {
-          r.sombra.set(i, { state: buf(s.size, `snap-${nombre}-s${i}`), conv: buf(conv.size, `snap-${nombre}-c${i}`) });
-        }
-      }
+      creaSombra(r, nombre);
       const enc = device.createCommandEncoder({ label: `instantanea:${nombre}` });
       for (const [i, { state: s, conv }] of ssm) {
         const d = r.sombra.get(i);
@@ -190,6 +192,65 @@ export function createState(device, hp, opts = {}) {
       }
       device.queue.submit([enc.finish()]);
       state.nPast = r.past;
+      return true;
+    },
+
+    // ── Sacar una instantánea del dispositivo y volver a meterla ──────────────
+    // Para guardarla en disco y no reprocesar el prompt de sistema en cada
+    // visita. Lo que describe una ranura es su estado recurrente (la sombra) MÁS
+    // las filas de la caché KV de las posiciones anteriores, que viven fuera de
+    // la foto: se exportan las dos. Las copias se ENCOLAN aquí mismo, antes de
+    // devolver, así que ven la caché tal como está ahora aunque el siguiente
+    // forward se encole justo después; solo la lectura es asíncrona.
+    exportaInstantanea(nombre = 'sistema') {
+      const r = ranuras.get(nombre);
+      if (!r || !r.sombra || r.past <= 0) return null;
+      const past = r.past;
+      const bpf = hp.kvHeads * hp.headDim * bytesKv;
+      const fuentes = [];
+      for (const [i, d] of r.sombra) fuentes.push([`s${i}`, d.state, 0, d.state.size], [`c${i}`, d.conv, 0, d.conv.size]);
+      for (const [i, c] of kv) fuentes.push([`k${i}`, c.k, 0, past * bpf], [`v${i}`, c.v, 0, past * bpf]);
+      const enc = device.createCommandEncoder({ label: `exporta:${nombre}` });
+      const lecturas = fuentes.map(([n, src, off, size]) => {
+        const dst = device.createBuffer({ label: `exp-${n}`, size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        enc.copyBufferToBuffer(src, off, dst, 0, size);
+        return [n, dst, size];
+      });
+      device.queue.submit([enc.finish()]);
+      return (async () => {
+        const partes = [];
+        try {
+          for (const [n, dst, size] of lecturas) {
+            await dst.mapAsync(GPUMapMode.READ);
+            partes.push({ n, data: dst.getMappedRange(0, size).slice(0) });
+            dst.unmap();
+          }
+        } finally {
+          for (const [, dst] of lecturas) dst.destroy();
+        }
+        return { past, bpf, kvF16, partes };
+      })();
+    },
+
+    // Mete en la ranura una instantánea exportada antes (por esta misma forma de
+    // estado). Comprueba que cada parte mide lo que debe y, si algo no cuadra,
+    // no toca nada y devuelve false: una foto que no es la suya daría texto de
+    // otra conversación sin ningún error.
+    importaInstantanea(nombre, datos) {
+      const bpf = hp.kvHeads * hp.headDim * bytesKv;
+      if (!datos || datos.bpf !== bpf || datos.kvF16 !== kvF16 || !(datos.past > 0) || datos.past > ctxLen) return false;
+      const r = ranura(nombre);
+      creaSombra(r, nombre);
+      const destinos = new Map();
+      for (const [i, d] of r.sombra) { destinos.set(`s${i}`, [d.state, d.state.size]); destinos.set(`c${i}`, [d.conv, d.conv.size]); }
+      for (const [i, c] of kv) { destinos.set(`k${i}`, [c.k, datos.past * bpf]); destinos.set(`v${i}`, [c.v, datos.past * bpf]); }
+      if (datos.partes.length !== destinos.size) return false;
+      for (const { n, data } of datos.partes) {
+        const d = destinos.get(n);
+        if (!d || data.byteLength !== d[1]) return false;
+      }
+      for (const { n, data } of datos.partes) device.queue.writeBuffer(destinos.get(n)[0], 0, data);
+      r.past = datos.past;
       return true;
     },
 

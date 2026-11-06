@@ -47,6 +47,7 @@ import { parseGGUF } from './gguf.js';
 // El registro va aparte para que la app pueda sondear disponibilidad sin
 // importarse el motor entero. Ver la cabecera de registro.js.
 import { MODELS, cachea } from './registro.js';
+import { creaSesionCpuRemota } from './cpu-proxy.js';
 
 export let name = 'Elffuss Engine · WebGPU';
 
@@ -126,6 +127,9 @@ async function tomarCerrojo(etiqueta) {
   return resultado;
 }
 let modelo = null, sesion = null, tk = null, gpu = null, muestreo = null;
+let modoCpu = false;           // el modelo corre en la CPU (sin WebGPU utilizable)
+// Contexto máximo en la CPU: su caché va en f32 en la misma pestaña que los pesos.
+const CTX_CPU = 4096;
 // ¿Este modelo espera un bloque de razonamiento en el prompt? Se DEDUCE de la
 // plantilla que trae el propio fichero, no se cablea por nombre de modelo: así
 // un GGUF sin razonamiento no recibe un bloque que no entiende, y uno nuevo que
@@ -146,6 +150,87 @@ let perdida = '';                          // motivo si el dispositivo se perdi�
 // hay que reiniciar. Se invalida ANTES de tocar el estado y solo se vuelve a
 // poner al terminar bien: si un turno revienta a medias, el siguiente reinicia.
 let consumidos = null;
+
+// ── El prompt de sistema, guardado en disco ─────────────────────────────────
+// La foto del sistema (ver la ranura 'sistema' en state.js) vivía solo en la
+// memoria de la pestaña: cada visita nueva volvía a procesar el prompt de
+// sistema entero antes de la primera letra. En un teléfono es la espera más
+// larga de cada visita, y se repetía en todas. Ahora la foto
+// —estado recurrente más las filas de la caché KV de esas posiciones— se guarda
+// en IndexedDB y la visita siguiente arranca desde ahí.
+//
+// La HUELLA es estricta porque una foto ajena no falla, contesta con el estado
+// de otra conversación: modelo (url y bytes), formato de la caché, versión de
+// este formato y las fichas EXACTAS del bloque de sistema, que además se
+// vuelven a comparar una a una al cargar. \`PREFIJO_FORMATO\` sube cuando cambie
+// la numérica del forward o lo que se guarda.
+// APAGADO por defecto: lo enciende la página con \`__ELFFUSS_PREFIJO_DISCO = true\`.
+// Solo sirve donde el prompt de sistema es FIJO (el chat de elffuss.com). En
+// Claw y Code el bloque de sistema lleva el estado vivo y cambia a cada paso:
+// guardarlo sería escribir mucho en cada visita para no reutilizarlo
+// nunca. Y como mucho UNA escritura por visita, por lo mismo.
+const PREFIJO_FORMATO = 1;
+let prefijoGuardadoEnVisita = false;
+const PREFIJO_GUARDADOS = 3;            // fotos que se conservan (las más recientes)
+const prefijoDiscoActivo = () => globalThis.__ELFFUSS_PREFIJO_DISCO === true && typeof indexedDB !== 'undefined';
+function abrePrefijos() {
+  return new Promise((ok, mal) => {
+    const rq = indexedDB.open('elffuss-prefijos', 1);
+    rq.onupgradeneeded = () => rq.result.createObjectStore('fotos');
+    rq.onsuccess = () => ok(rq.result);
+    rq.onerror = () => mal(rq.error);
+  });
+}
+const pideIdb = (rq) => new Promise((ok, mal) => { rq.onsuccess = () => ok(rq.result); rq.onerror = () => mal(rq.error); });
+async function huellaPrefijo(fichas) {
+  const m = MODELS[clave] || {};
+  const url = Array.isArray(m.url) ? m.url.map((f) => f.url).join('|') : String(m.url || '');
+  const texto = JSON.stringify([PREFIJO_FORMATO, url, m.bytes || 0, sesion?.state?.kvF16 ?? null, fichas.length, fichas.join(',')]);
+  const h = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(texto));
+  return [...new Uint8Array(h)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+async function guardaPrefijo(fichas) {
+  if (!prefijoDiscoActivo() || !sesion || prefijoGuardadoEnVisita) return;
+  prefijoGuardadoEnVisita = true;
+  const salida = sesion.state.exportaInstantanea('sistema');
+  if (!salida) return;
+  try {
+    const [datos, llave] = await Promise.all([salida, huellaPrefijo(fichas)]);
+    const db = await abrePrefijos();
+    const tx = db.transaction('fotos', 'readwrite');
+    const st = tx.objectStore('fotos');
+    await pideIdb(st.put({ t: Date.now(), fichas: Array.from(fichas), ...datos }, llave));
+    const todas = await pideIdb(st.getAllKeys());
+    if (todas.length > PREFIJO_GUARDADOS) {
+      const conT = [];
+      for (const k of todas) conT.push([k, (await pideIdb(st.get(k)))?.t || 0]);
+      conT.sort((a, b) => b[1] - a[1]);
+      for (const [k] of conT.slice(PREFIJO_GUARDADOS)) st.delete(k);
+    }
+    db.close();
+    console.log(`[engine] prefijo de sistema guardado en disco · ${fichas.length} fichas`);
+  } catch (e) {
+    console.warn('[engine] no se pudo guardar el prefijo de sistema:', e?.message || e);
+  }
+}
+async function cargaPrefijo(fichas) {
+  if (!prefijoDiscoActivo() || !sesion) return false;
+  try {
+    const llave = await huellaPrefijo(fichas);
+    const db = await abrePrefijos();
+    const st = db.transaction('fotos', 'readwrite').objectStore('fotos');
+    const d = await pideIdb(st.get(llave));
+    if (d) st.put({ ...d, t: Date.now() }, llave);
+    db.close();
+    if (!d || !Array.isArray(d.fichas) || d.fichas.length !== fichas.length || d.fichas.some((t, k) => t !== fichas[k])) return false;
+    const ok = sesion.state.importaInstantanea('sistema', d);
+    if (ok) console.log(`[engine] prefijo de sistema cargado de disco · ${fichas.length} fichas sin procesar`);
+    return ok;
+  } catch (e) {
+    console.warn('[engine] no se pudo leer el prefijo de sistema:', e?.message || e);
+    return false;
+  }
+}
 
 export function configure(key) {
   if (key && MODELS[key] && key !== clave) {
@@ -486,9 +571,22 @@ export async function load(onProgress = () => {}) {
   cargando = (async () => {
     const m = modeloActivo();
     try {
-      onProgress('Encendiendo la GPU…');
       perdida = '';
-      gpu = await requestDevice({ label: 'elffuss-engine' });
+      // ── TARJETA O CPU ────────────────────────────────────────────────────
+      // Sin WebGPU utilizable (no hay `navigator.gpu`, ni adaptador, ni f16) el
+      // modelo corre en la CPU (cpu.js, en un Worker) con la misma plantilla,
+      // tokenizador, muestreo y prefijo. `__ELFFUSS_CPU = true` la fuerza;
+      // `= false` la prohíbe y deja el error de la tarjeta como estaba.
+      modoCpu = globalThis.__ELFFUSS_CPU === true;
+      if (!modoCpu) {
+        onProgress('Encendiendo la GPU…');
+        try { gpu = await requestDevice({ label: 'elffuss-engine' }); }
+        catch (e) {
+          if (globalThis.__ELFFUSS_CPU === false || typeof Worker === 'undefined') throw e;
+          console.warn('[engine] sin WebGPU utilizable, el modelo va en la CPU:', e?.message || e);
+          modoCpu = true; gpu = null;
+        }
+      }
 
       // El device se comprueba al nacer, pero también se puede morir DESPUÉS: el
       // proceso gráfico del navegador se reinicia y se lleva por delante los
@@ -496,7 +594,7 @@ export async function load(onProgress = () => {}) {
       // lo siguiente que ocurre es un forward que devuelve ceros o una promesa
       // que no vuelve nunca: un cuelgue sin causa visible. Aquí se entera, y así
       // el siguiente turno puede decir qué pasó en vez de quedarse mudo.
-      gpu.device.lost.then(info => {
+      if (gpu) gpu.device.lost.then(info => {
         // El estado se anula SIEMPRE, tanto si el dispositivo se cayó solo como si
         // lo tiramos nosotros. Antes la rama 'destroyed' salía sin registrar nada y
         // —lo grave— sin anular `sesion` ni `modelo`: la app se quedaba creyendo
@@ -557,6 +655,14 @@ export async function load(onProgress = () => {}) {
       // Los interruptores «rápido» de esta arquitectura, ANTES de cargar los
       // pesos (ver `aplicaRapido`); y fuera los que se pusieron para otra.
       const rapido = aplicaRapido(info.meta['general.architecture']);
+      // Sin subgrupos (el teléfono) el GEMM del prompt va por la tesela con memoria
+      // compartida: medido en un teléfono, ida y vuelta, ×1,24 al leer el prompt y
+      // el mismo texto token a token que el exacto. En un ordenador con subgrupos
+      // perdía, así que allí no se toca. La página manda si ya lo fijó.
+      if (gpu && !gpu.subgroupSize && globalThis.__ELFFUSS_GEMM2_TESELA === undefined && rapido.includes('__ELFFUSS_GEMM2')) {
+        globalThis.__ELFFUSS_GEMM2_TESELA = true;
+        rapido.push('__ELFFUSS_GEMM2_TESELA');
+      }
       if (rapido.length) console.info(`[engine] interruptores rápidos por defecto: ${rapido.join(' ')}`);
       tk = createTokenizer(info.meta);
       // El lote del prefill es del MODELO: 32 por defecto (el bucle recurrente
@@ -571,6 +677,27 @@ export async function load(onProgress = () => {}) {
       // subirlos según llegan, y el tiempo se lo lleva casi todo la red. Decir
       // solo «subiendo» mientras alguien espera a que baje el modelo entero
       // hace que parezca colgado en el paso equivocado.
+      if (modoCpu) {
+        // En la CPU los pesos van a la memoria del Worker. Contexto como mucho
+        // CTX_CPU: la caché va en f32 dentro de la misma pestaña que los pesos.
+        let ultimoCpu = -1;
+        const ctxCpu = Math.min(m.ctx || CTX_CPU, CTX_CPU);
+        sesion = await creaSesionCpuRemota(ranged, {
+          contextLen: ctxCpu,
+          onProgress: (h, t) => {
+            const pct = Math.floor(h / t * 100);
+            if (pct === ultimoCpu) return;
+            ultimoCpu = pct;
+            onProgress(`Cargando el modelo en la CPU · ${pct} %`);
+          },
+        });
+        modelo = { cpu: true };
+        ctxEfectivo = ctxCpu;
+        name = 'Elffuss Engine · ' + m.label + ' · CPU';
+        console.log(`[engine] ${m.label} listo desde ${donde} · ${sesion.state.summary()}`);
+        onProgress('Modelo listo · 100 %');
+        return;
+      }
       const etiqueta = donde.startsWith('red')
         ? 'Descargando el modelo y subiéndolo a la GPU'
         : 'Subiendo el modelo a la GPU';
@@ -1291,6 +1418,12 @@ async function turno(history, system, onToken, { senal, onPrefill, tLlamada, res
   // se apaga en vez de restaurar un punto que no es el que se cree.
   const sistemaEsPrefijo = fichasSistema.length < cabeza.length &&
     fichasSistema.every((t, k) => t === cabeza[k]);
+  // Primera vuelta de esta visita (nada ingerido aún): la foto del sistema
+  // puede estar en disco de una visita anterior.
+  if (!sistemaFoto && !consumidos && quiereReuso && sistemaEsPrefijo && sesion.state.nPast === 0 &&
+      await cargaPrefijo(fichasSistema)) {
+    sistemaFoto = fichasSistema;
+  }
   const mismoSistema = !!sistemaFoto && sistemaFoto.length === fichasSistema.length &&
     sistemaFoto.every((t, k) => t === fichasSistema[k]);
 
@@ -1407,6 +1540,7 @@ async function turno(history, system, onToken, { senal, onPrefill, tLlamada, res
       sesion.recycle();
       sesion.state.instantanea('sistema');
       sistemaFoto = fichasSistema;
+      guardaPrefijo(fichasSistema);     // sin esperar: las copias ya van en la cola
       if (entradaCabeza.length > n) {
         await sesion.forward(entradaCabeza.slice(n), opciones(n, total));
         sesion.recycle();
@@ -1509,7 +1643,8 @@ async function turno(history, system, onToken, { senal, onPrefill, tLlamada, res
       if (senal.aborted) throw errorParado();
     }
     if (id === undefined) {
-      const todos = new Float32Array(await readback(gpu.device, logits, 0, logitsTokens * vocab * 4));
+      const todos = logits instanceof Float32Array ? logits
+        : new Float32Array(await readback(gpu.device, logits, 0, logitsTokens * vocab * 4));
       if (senal.aborted) throw errorParado();
       const ultimo = todos.subarray((logitsTokens - 1) * vocab, logitsTokens * vocab);
       const tS = ahora(); msReadback += tS - tR;

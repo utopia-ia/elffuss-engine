@@ -59,7 +59,16 @@ export function createGemvOps(device, { ctx, subgroupSize = 0, despacha, comprue
 
   // El reparto de carriles supone subgrupos de 32 exactos: con otro ancho,
   // camino de siempre. `__ELFFUSS_NO_SUBGROUP` (lo usan pruebas internas) manda.
-  const listo = () => subgroupSize === 32 && !globalThis.__ELFFUSS_NO_SUBGROUP;
+  //
+  // Sin subgrupos (el teléfono) va una variante que suma los carriles en memoria
+  // de grupo. Medido en un teléfono, A/B alterno ABBA: escribe unas 2,5 veces más
+  // rápido que el camino de siempre, con el mismo texto token a token.
+  // \`__ELFFUSS_GEMV2_SINSUB = false\` la apaga, y \`= 'forzar'\` la usa aunque haya
+  // subgrupos, para validarla en un ordenador.
+  const sinSub = () => globalThis.__ELFFUSS_GEMV2_SINSUB === 'forzar'
+    || (subgroupSize === 0 && globalThis.__ELFFUSS_GEMV2_SINSUB !== false);
+  const listo = () => (subgroupSize === 32 || sinSub()) && !globalThis.__ELFFUSS_NO_SUBGROUP;
+  const sg = () => !sinSub();
 
   // Shaders que el compilador del navegador rechazó. naga los valida todos,
   // pero el compilador de cada navegador tiene su propio análisis, y un rechazo
@@ -139,9 +148,9 @@ export function createGemvOps(device, { ctx, subgroupSize = 0, despacha, comprue
     async matmul(tipo, wBuf, xBuf, rows, k, tokens = 1) {
       const g = prepara(tipo, k, tokens, [wBuf], [rows]);
       if (!g) return null;
-      const forma = gemv2Forma({ tipo, filas: [rows], k, T: tokens, nm: 1,
+      const forma = gemv2Forma({ sg: sg(), tipo, filas: [rows], k, T: tokens, nm: 1,
         maxCompartida: limites.maxComputeWorkgroupStorageSize || 16384 });
-      const o = { tipo, R: forma.R, NSG: forma.NSG, T: tokens, modo: 'una', n: 1, u4x8: u4x8(), cola: g.cola };
+      const o = { tipo, R: forma.R, NSG: forma.NSG, T: tokens, modo: 'una', n: 1, u4x8: u4x8(), cola: g.cola, sg: sg() };
       const p = await pipeline(o);
       if (!p) return null;
       const y = ctx.alloc(rows * tokens * 4, 'matmul.y');
@@ -160,9 +169,9 @@ export function createGemvOps(device, { ctx, subgroupSize = 0, despacha, comprue
       const g = prepara(tipo, k, tokens, [wGate, wUp], [rows, rows]);
       if (!g) return null;
       if ((limites.maxStorageBuffersPerShaderStage || 8) < 4) return null;
-      const forma = gemv2Forma({ tipo, filas: [rows], k, T: tokens, nm: 2,
+      const forma = gemv2Forma({ sg: sg(), tipo, filas: [rows], k, T: tokens, nm: 2,
         maxCompartida: limites.maxComputeWorkgroupStorageSize || 16384 });
-      const o = { tipo, R: forma.R, NSG: forma.NSG, T: tokens, modo: 'swiglu', n: 2, u4x8: u4x8(), cola: g.cola };
+      const o = { tipo, R: forma.R, NSG: forma.NSG, T: tokens, modo: 'swiglu', n: 2, u4x8: u4x8(), cola: g.cola, sg: sg() };
       const p = await pipeline(o);
       if (!p) return null;
       const y = ctx.alloc(rows * tokens * 4, 'swiglu.out');
@@ -188,9 +197,9 @@ export function createGemvOps(device, { ctx, subgroupSize = 0, despacha, comprue
       if ((limites.maxStorageBuffersPerShaderStage || 8) < 2 * n + 1) return null;
       const g = prepara(tipo, k, tokens, ws, filas);
       if (!g) return null;
-      const forma = gemv2Forma({ tipo, filas, k, T: tokens, nm: 1,
+      const forma = gemv2Forma({ sg: sg(), tipo, filas, k, T: tokens, nm: 1,
         maxCompartida: limites.maxComputeWorkgroupStorageSize || 16384 });
-      const o = { tipo, R: forma.R, NSG: forma.NSG, T: tokens, modo: 'secciones', n, u4x8: u4x8(), cola: g.cola };
+      const o = { tipo, R: forma.R, NSG: forma.NSG, T: tokens, modo: 'secciones', n, u4x8: u4x8(), cola: g.cola, sg: sg() };
       const p = await pipeline(o);
       if (!p) return null;
       const ys = filas.map((f) => ctx.alloc(f * tokens * 4, 'matmul.y'));

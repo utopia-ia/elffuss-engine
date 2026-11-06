@@ -164,12 +164,13 @@ export function gemv2BytesNecesarios(tipo, nBloques) {
 // { R, NSG }` la fija A MANO para el barrido, y una forma que no vale LANZA en
 // vez de cambiarse por otra: un número con una etiqueta que no es la suya es
 // peor que no tenerlo.
-export function gemv2Forma({ tipo, filas, k, T = 1, nm = 1, maxCompartida = 16384 }) {
+export function gemv2Forma({ tipo, filas, k, T = 1, nm = 1, maxCompartida = 16384, sg = true }) {
   const F = gemv2Formato(tipo);
   const pasos = Math.ceil(k / F.bloque / F.bloquesPaso);
   const lista = Array.isArray(filas) ? filas : [filas];
   const divide = (R) => lista.every((f) => f % R === 0);
-  const compartida = (R, NSG) => (NSG > 1 ? nm * R * T * GEMV2_PARTES * 32 * 4 : 0);
+  // Sin subgrupos, la suma final de los 32 carriles va por memoria de grupo (`red`): cuenta también.
+  const compartida = (R, NSG) => (NSG > 1 ? nm * R * T * GEMV2_PARTES * 32 * 4 : 0) + (sg ? 0 : nm * R * T * 32 * 4);
   const pedida = globalThis.__ELFFUSS_GEMV2_FORMA;
   if (pedida && typeof pedida === 'object') {
     const { R, NSG } = pedida;
@@ -208,7 +209,7 @@ export function gemv2Forma({ tipo, filas, k, T = 1, nm = 1, maxCompartida = 1638
 // (unpack4xI8 solo existe en la familia Q8).
 export function gemv2Clave(o) {
   const u = o.u4x8 && familia(o.tipo) === 'Q8' ? 1 : 0;
-  return `gemv2_${o.tipo}_${o.modo}${o.n}_R${o.R}_S${o.NSG}_T${o.T}_c${o.cola ? 1 : 0}_u${u}`;
+  return `gemv2_${o.tipo}_${o.modo}${o.n}_R${o.R}_S${o.NSG}_T${o.T}_c${o.cola ? 1 : 0}_u${u}${o.sg === false ? '_g0' : ''}`;
 }
 
 // El uniforme, en el orden exacto del `struct Params` de abajo: cuatro u32 y
@@ -355,7 +356,7 @@ ${L(4, (g) => `          let x${t}_${g} = x[xq${t} + ${8 * g}u];
 const familia = (tipo) => (tipo.startsWith('Q8') ? 'Q8' : tipo.startsWith('Q4') ? 'Q4' : 'Q6K');
 
 // ── El shader ───────────────────────────────────────────────────────────────
-// o = { tipo, R, NSG, T, modo, n, u4x8, cola }
+// o = { tipo, R, NSG, T, modo, n, u4x8, cola, sg }
 //   · modo 'una': una matriz → y0.
 //   · modo 'swiglu': n = 2, gate (w0) y up (w1) con las MISMAS filas; cada
 //     grupo hace sus R filas de las dos y escribe silu(gate)·up.
@@ -364,9 +365,13 @@ const familia = (tipo) => (tipo.startsWith('Q8') ? 'Q8' : tipo.startsWith('Q4') 
 //   · u4x8: usar `unpack4xI8` (extensión de lenguaje `packed_4x8_integer_dot_product`);
 //     sin ella, los mismos desplazamientos a mano (mismos enteros, misma suma).
 //   · cola: K no es múltiplo del paso y hay que guardar el último bloque.
+//   · sg: false para dispositivos sin subgrupos (el teléfono): la suma de los 32
+//     carriles se hace en memoria de grupo, en árbol, en vez de con subgroupAdd.
+//     Mismos productos y mismas sumas parciales; cambia el orden de la última suma.
 // Enlaces: pesos 0..n−1, `x` en n, salidas a continuación, el uniforme al final.
 export function gemv2Shader(o) {
   const { tipo, R, NSG, T, modo, n, u4x8, cola } = o;
+  const sg = o.sg !== false;
   const F = gemv2Formato(tipo);
   const fam = familia(tipo);
   const P = GEMV2_PARTES;
@@ -461,16 +466,40 @@ ${bucle([{ w: `w${m}`, m: 0 }], '  ')}`) + '\n  }';
   const items = [];
   for (let m = 0; m < nm; m++) for (let r = 0; r < R; r++) for (let t = 0; t < T; t++) items.push({ m, r, t });
   const base = ({ m, r, t }) => ((m * R + r) * T + t) * P;
-  const reduccion = NSG === 1
-    ? items.map((it) => `  let tot${it.m}_${it.r}_${it.t} = subgroupAdd(((${A(it.m, it.r, it.t, 0)} + ${A(it.m, it.r, it.t, 1)}) + ` +
-      `${A(it.m, it.r, it.t, 2)}) + ${A(it.m, it.r, it.t, 3)});`).join('\n')
-    : `${items.map((it) => L(J, (j) => `  parc[(${base(it)}u + g + ${NSG * j}u) * 32u + lane] = ${A(it.m, it.r, it.t, j)};`)).join('\n')}
+  const suma4 = (v) => `((${v(0)} + ${v(1)}) + ${v(2)}) + ${v(3)}`;
+  const deParc = (it) => { const b0 = base(it) * 32; return (p) => `parc[${b0 + 32 * p}u + lane]`; };
+  let reduccion;
+  if (sg) {
+    reduccion = NSG === 1
+      ? items.map((it) => `  let tot${it.m}_${it.r}_${it.t} = subgroupAdd(${suma4((p) => A(it.m, it.r, it.t, p))});`).join('\n')
+      : `${items.map((it) => L(J, (j) => `  parc[(${base(it)}u + g + ${NSG * j}u) * 32u + lane] = ${A(it.m, it.r, it.t, j)};`)).join('\n')}
   workgroupBarrier();
-${items.map((it) => {
-    const b0 = base(it) * 32;
-    return `  let tot${it.m}_${it.r}_${it.t} = subgroupAdd(((parc[${b0}u + lane] + parc[${b0 + 32}u + lane]) + ` +
-      `parc[${b0 + 64}u + lane]) + parc[${b0 + 96}u + lane]);`;
-  }).join('\n')}`;
+${items.map((it) => `  let tot${it.m}_${it.r}_${it.t} = subgroupAdd(${suma4(deParc(it))});`).join('\n')}`;
+  } else {
+    // Sin subgrupos: cada uno de los 32 carriles deja su suma en \`red\` y se
+    // reducen a la mitad cinco veces, con una barrera entre pasos. Las barreras
+    // quedan fuera de los \`if\` (control uniforme); solo escriben los 32 primeros.
+    const ponRed = (v) => items.map((it, k) => `    red[${k * 32}u + lane] = ${v(it)};`).join('\n');
+    const arbol = [16, 8, 4, 2, 1].map((st) => `  if (lid.x < ${st}u) {
+${items.map((it, k) => `    red[${k * 32}u + lid.x] = red[${k * 32}u + lid.x] + red[${k * 32 + st}u + lid.x];`).join('\n')}
+  }
+  workgroupBarrier();`).join('\n');
+    reduccion = NSG === 1
+      ? `  {
+${ponRed((it) => suma4((p) => A(it.m, it.r, it.t, p)))}
+  }
+  workgroupBarrier();
+${arbol}
+${items.map((it, k) => `  let tot${it.m}_${it.r}_${it.t} = red[${k * 32}u];`).join('\n')}`
+      : `${items.map((it) => L(J, (j) => `  parc[(${base(it)}u + g + ${NSG * j}u) * 32u + lane] = ${A(it.m, it.r, it.t, j)};`)).join('\n')}
+  workgroupBarrier();
+  if (lid.x < 32u) {
+${ponRed((it) => suma4(deParc(it)))}
+  }
+  workgroupBarrier();
+${arbol}
+${items.map((it, k) => `  let tot${it.m}_${it.r}_${it.t} = red[${k * 32}u];`).join('\n')}`;
+  }
 
   const destino = (r, t) => `${t ? `${t}u * filas + ` : ''}row0 + ${r}u`;
   let escritura;
@@ -496,15 +525,14 @@ ${F.repack ? '  let esc0 = params.esc[sec];\n' : ''}  let row0 = (wg - g0) * ${R
 ${F.repack ? `  let esc0 = params.esc.x;\n${nm > 1 ? '  let esc1 = params.esc.y;\n' : ''}` : ''}  let row0 = wg * ${R}u;
   if (row0 >= filas) { return; }`;
 
-  return /* wgsl */`enable subgroups;
-
+  return /* wgsl */`${sg ? 'enable subgroups;\n' : ''}
 // gemv2 ${tipo} · ${modo} (${n}) · R=${R} · NSG=${NSG} · T=${T}${cola ? ' · cola' : ''}
 struct Params {
   k4 : u32, bpr : u32, pasos : u32, nsec : u32,
   filas : vec4<u32>, esc : vec4<u32>, fin : vec4<u32>,
 };
 ${enlaces}
-${NSG > 1 ? `var<workgroup> parc : array<f32, ${nm * R * T * P * 32}>;\n` : ''}
+${NSG > 1 ? `var<workgroup> parc : array<f32, ${nm * R * T * P * 32}>;\n` : ''}${sg ? '' : `var<workgroup> red : array<f32, ${items.length * 32}>;\n`}
 ${ayudas.join('\n')}
 
 @compute @workgroup_size(${32 * NSG})

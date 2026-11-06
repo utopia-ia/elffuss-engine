@@ -25,8 +25,9 @@
 Inference runs in the page, on WebGPU, and the weights are read from Hugging Face with HTTP range requests. The page
 needs a secure context (`https://`, or `http://localhost` and `http://127.0.0.1`) and a WebGPU adapter that offers the
 `shader-f16` feature and a storage-buffer binding limit large enough for the model's largest tensor (see the
-[limits of this version](#limits-of-this-version)). Serve this repository with any static file server and open a page
-like this one from it.
+[limits of this version](#limits-of-this-version)). Without a WebGPU device, LFM3 runs on the CPU instead, behind the
+same API (see the CPU path in the limits). Serve this repository with any static file server and open a page like this
+one from it.
 
 ```html
 <!doctype html>
@@ -100,6 +101,12 @@ reasons, how its turns are closed and, for `lfm3`, the start token.
 - **WebGPU features.** The attention cache is stored in half precision, so the engine needs the `shader-f16` feature:
   without it, `load()` finishes and the first `chat()` fails when it compiles its shaders. It also refuses a model
   that has a tensor larger than the adapter's `maxStorageBufferBindingSize`, a limit it asks the adapter for.
+- **The CPU path.** When `load()` cannot get a WebGPU device (no `navigator.gpu`, no adapter, or the device request
+  fails), it runs the model in a Worker with WebAssembly SIMD. It computes only the `lfm3` architecture, with `Q8_0`
+  or `Q4_0` matrices, and caps the context at 4096 tokens. It uses one thread unless the page is cross-origin isolated
+  (COOP and COEP headers); then it uses half the cores the browser reports, at most 8. An adapter without
+  `shader-f16` does not send the engine to the CPU by itself: a page that checks the adapter can set
+  `globalThis.__ELFFUSS_CPU = true` before `load()`, which forces the CPU path; `false` turns it off.
 - **No cache of its own.** Inside the Elffuss sites the host app keeps the model in the browser. Anywhere else, every
   `load()` reads the model from the network again. Even so, `load()` first checks the browser's storage estimate as if
   it were going to keep the model, and refuses with a message about disk space when the estimate is too small.
@@ -119,7 +126,7 @@ reasons, how its turns are closed and, for `lfm3`, the start token.
 ## Layout
 
 ```
-js/         the runtime: 33 ES modules, served as they are written
+js/         the runtime: 49 ES modules, served as they are written
             provider.js    the chat API of the quick start
             registro.js    the model registry; it imports nothing, so a page can list models without the engine
             gguf.js        the GGUF reader, which reads by byte ranges
@@ -128,6 +135,10 @@ js/         the runtime: 33 ES modules, served as they are written
             model.js       a model session on WebGPU
             device.js      the WebGPU device
             repack.js      reorders Q8_0 and Q4_0 weights at load, for the faster paths
+            cpu.js         a model session on the CPU; cpu-*.js are its Worker, its threads and its WebAssembly
+                           kernels
+            memory*.js     the client of the user memory that the Elffuss apps share; tuning.js holds its settings
+                           per model
             the rest       the shaders (kernels.*.wgsl.js) and what runs them (ops.js and ops.*.js, state.js,
                            hadamard.js, topk.js, quant-tables.js)
 assets/     the logo

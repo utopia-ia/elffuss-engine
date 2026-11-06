@@ -5,7 +5,31 @@ everything is listed under Unreleased.
 
 ## Unreleased
 
-### Changed in this snapshot
+### Added in this snapshot: the CPU path
+
+- LFM3 also runs on the CPU, for pages without WebGPU. When `load()` cannot get a WebGPU device (no `navigator.gpu`,
+  no adapter, or the device request fails), it loads the model into a Worker and runs it with WebAssembly SIMD,
+  behind the same chat API and with the same template, tokenizer and sampler (`js/cpu.js` and `js/cpu-*.js`). The
+  kernels are compiled to WebAssembly and embedded in `js/cpu-kernels.js` in four builds, with and without relaxed
+  SIMD and with and without threads; the engine takes the relaxed build when the browser validates it. Both give the
+  same bits, because the kernels are compiled without fused multiply-add contraction.
+- Threads for the CPU path when the page is cross-origin isolated: half the cores the browser reports, at most 8.
+  Without isolation it uses one thread.
+- `globalThis.__ELFFUSS_CPU`, set before `load()`: `true` forces the CPU path, `false` keeps the WebGPU error.
+
+  The CPU path computes only the `lfm3` architecture, with `Q8_0` or `Q4_0` matrices, and caps the context at 4096
+  tokens. With LFM3 1.7B in `Q4_0` (the QAD file), greedy decoding gives the same tokens as llama.cpp.
+
+### Changed in this snapshot: the CPU path
+
+- The runtime has 49 modules (43 before).
+
+### Added in the previous snapshot: the memory client
+
+- Nine `js/memory*.js` modules: the client of the user memory that the Elffuss apps share, and `js/tuning.js`, its
+  settings per model.
+
+### Changed in the snapshot of the faster LFM3 paths
 
 - LFM3 runs faster by default, in prompt processing and in generation. When the GGUF header names the `lfm3`
   architecture, the engine turns on a set of faster code paths before it loads the weights:
@@ -23,7 +47,7 @@ everything is listed under Unreleased.
   ones.
 - The runtime has 33 modules (20 before).
 
-### Added in this snapshot
+### Added in the snapshot of the faster LFM3 paths
 
 - The `Q4_0` weight type.
 - `globalThis.__ELFFUSS_RAPIDO = false`, set before `load()`, keeps the previous code paths for LFM3. The individual
@@ -33,7 +57,7 @@ everything is listed under Unreleased.
 - Two more switches that no model turns on: `__ELFFUSS_PLAN` reuses bind groups, uniforms and readback buffers from
   token to token, and `__ELFFUSS_TOPK_GPU` picks the sampling candidates on the device and reads back only those.
 
-### Added in the previous snapshot
+### Added in the LFM3 snapshot
 
 - The `lfm3` architecture (LFM3 1.7B): gated short convolutions, sliding-window and global attention with their own
   rotary bases and `rope_freqs`, the per-head output gate and the norms after attention and after the feed-forward.
@@ -44,7 +68,7 @@ everything is listed under Unreleased.
   registry entry can also set its own prompt batch.
 - Generation submits its WebGPU work layer by layer instead of once per token.
 
-### Fixed in the previous snapshot
+### Fixed in the LFM3 snapshot
 
 - The sampler sorted the whole vocabulary on every token; it now keeps the top candidates in a heap.
 - The reply was decoded again in full on every token; it is now decoded as it streams.

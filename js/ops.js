@@ -141,6 +141,8 @@ function createContext(device, opts = {}) {
     uniformFree: [],
     scratch: [],
     scratchFree: new Map(),           // tamaño → [buffers]
+    _usoTalla: new Map(),             // tamaño → último token en que se prestó
+    _tokenPozo: 0,
   };
   // Estado del PLAN (`__ELFFUSS_PLAN`, ver `abreLotePlan`). ctx._plan se fija
   // al abrir cada lote y vuelve a false al cerrarlo: fuera de un lote todo va
@@ -242,6 +244,7 @@ function createContext(device, opts = {}) {
     const free = ctx.scratchFree.get(size);
     let buf = free && free.pop();
     if (!buf) buf = device.createBuffer({ label, size, usage: storageUsage() });
+    ctx._usoTalla.set(size, ctx._tokenPozo);
     ctx.marcaDe.set(buf, ++reparto);
     ctx.scratch.push({ buf, size });
     ctx.vivosBytes += size;
@@ -259,6 +262,21 @@ function createContext(device, opts = {}) {
     }
     ctx.scratch = [];
     ctx.vivosBytes = 0;
+    // Lo que el pozo guarda y nadie pide se DESTRUYE. Los intermedios de la
+    // atención cambian de talla con el contexto, y sin esto cada talla vieja se
+    // quedaba en el pozo para siempre: memoria muerta que crece con el cuadrado
+    // del contexto. En un ordenador no se nota; en un teléfono, donde la memoria
+    // del dispositivo cuenta en el tope de la pestaña, una respuesta larga la
+    // mataba. Una talla que lleva más de POZO_RESPIRO tokens sin prestarse no
+    // vuelve (el contexto solo crece): sus búferes se sueltan. \`destroy()\` es
+    // seguro con trabajo ya enviado: el navegador espera a que termine.
+    ctx._tokenPozo++;
+    for (const [size, lista] of ctx.scratchFree) {
+      if (ctx._tokenPozo - (ctx._usoTalla.get(size) ?? 0) <= POZO_RESPIRO) continue;
+      for (const b of lista) b.destroy();
+      ctx.scratchFree.delete(size);
+      ctx._usoTalla.delete(size);
+    }
     if (globalThis.__ELFFUSS_PLAN === true) ordenaPozo(ctx);
   };
 
@@ -480,6 +498,9 @@ function abreLotePlan(ctx) {
   ctx._ranura = 0;
   ctx._memoLote = ctx._plan ? new Map() : null;
 }
+
+// Tokens que una talla del pozo puede pasar sin prestarse antes de soltarla.
+const POZO_RESPIRO = 2;
 
 // Tope de bind groups guardados. Un prefill con un último lote de largo nuevo
 // crea los suyos; sin tope, una sesión larga los acumularía sin fin.
