@@ -19,7 +19,7 @@
 // La caché KV vive en la memoria del módulo, en f32.
 
 import { WASM_ESTRICTO, WASM_RELAJADO, WASM_ESTRICTO_HILOS, WASM_RELAJADO_HILOS } from './cpu-kernels.js';
-import { CTL, PASO_DESC, KERNEL, MAX_MATRICES, marca, pideTrozo, ejecutaTrozo, escribeFloat } from './cpu-trabajo.js';
+import { CTL, PASO_DESC, KERNEL, MAX_MATRICES, marca, pideTrozo, ejecutaTrozo, escribeFloat, cuadraInstantanea } from './cpu-trabajo.js';
 
 const QK = 32;
 const BQ4 = 18, BQ8 = 34, BACT = 40;          // bytes por bloque (ver kernels.c)
@@ -521,9 +521,32 @@ export function creaSesionCpu(modelo, { contextLen }) {
       if (nombre === undefined) { for (const r of ranuras.values()) r.past = -1; return; }
       const r = ranuras.get(nombre); if (r) r.past = -1;
     },
-    // El prefijo en disco es de la tarjeta (otro formato): en CPU no se guarda.
-    exportaInstantanea() { return null; },
-    importaInstantanea() { return false; },
+    // El prefijo en disco: el mismo sobre que en la tarjeta ({ past, bpf, kvF16,
+    // partes }), con la caché en f32 y solo el estado de la convolución. Las
+    // filas de la caché van aparte porque la foto no las copia (ver arriba). El
+    // proveedor pone «cpu» en la huella, así que una foto de la tarjeta nunca se
+    // carga aquí ni al revés; y aunque llegara, sus partes no cuadran y se rechaza.
+    formaInstantanea() { return { bpf: paso * 4, kv: [...kv.keys()], conv: [...conv.keys()], convBytes: (CK - 1) * E * 4 }; },
+    exportaInstantanea(nombre = 'sistema') {
+      const r = ranuras.get(nombre);
+      if (!r || !r.conv || r.past <= 0) return null;
+      const n = r.past * paso, partes = [];
+      for (const [i, s] of r.conv) partes.push({ n: `c${i}`, data: s.slice().buffer });
+      for (const [i, c] of kv) partes.push({ n: `k${i}`, data: vista(c.k, n).slice().buffer }, { n: `v${i}`, data: vista(c.v, n).slice().buffer });
+      return { past: r.past, bpf: paso * 4, kvF16: false, partes };
+    },
+    importaInstantanea(nombre, d) {
+      if (!cuadraInstantanea(state.formaInstantanea(), d, contextLen)) return false;
+      const por = new Map(d.partes.map((p) => [p.n, p.data]));
+      for (const [i, c] of kv) {
+        vista(c.k, d.past * paso).set(new Float32Array(por.get(`k${i}`)));
+        vista(c.v, d.past * paso).set(new Float32Array(por.get(`v${i}`)));
+      }
+      const r = ranura(nombre);
+      r.conv = new Map([...conv.keys()].map((i) => [i, new Float32Array(por.get(`c${i}`)).slice()]));
+      r.past = d.past;
+      return true;
+    },
     summary() {
       const mb = (kv.size * 2 * contextLen * paso * 4) / 1048576;
       return `CPU (${modelo.kernels}) · ${kv.size} capas KV (${mb.toFixed(0)} MiB a ${contextLen} de contexto, f32) · ${conv.size} capas de convolución`;

@@ -69,3 +69,14 @@ export function ejecutaTrozo(e, c, i, yo) {
     default: throw new Error(`kernel desconocido ${c[b]}`);
   }
 }
+
+// ¿Es esta foto de prefijo de ESTA sesión de CPU? La forma (bytes por fila,
+// capas de caché y de convolución) la da `formaInstantanea()`; la usan el estado
+// y el proxy de la página, que tiene que contestar sin preguntar al Worker.
+export function cuadraInstantanea(forma, d, ctx) {
+  if (!d || d.bpf !== forma.bpf || d.kvF16 !== false || !(d.past > 0) || d.past > ctx || !Array.isArray(d.partes)) return false;
+  if (d.partes.length !== forma.conv.length + 2 * forma.kv.length) return false;
+  const por = new Map(d.partes.map((p) => [p.n, p.data?.byteLength]));
+  return forma.conv.every((i) => por.get(`c${i}`) === forma.convBytes) &&
+    forma.kv.every((i) => por.get(`k${i}`) === d.past * forma.bpf && por.get(`v${i}`) === d.past * forma.bpf);
+}

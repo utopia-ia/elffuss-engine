@@ -177,7 +177,10 @@ function abrePrefijos() {
   return new Promise((ok, mal) => {
     const rq = indexedDB.open('elffuss-prefijos', 1);
     rq.onupgradeneeded = () => rq.result.createObjectStore('fotos');
-    rq.onsuccess = () => ok(rq.result);
+    // Una conexión por uso y siempre cerrada (finally): si el navegador la
+    // cierra a medias (WebKit lo hace solo: pestaña dormida, falta de memoria),
+    // el fallo cae en el catch y es solo una caché que no se usa esta vez.
+    rq.onsuccess = () => { rq.result.onversionchange = () => rq.result.close(); ok(rq.result); };
     rq.onerror = () => mal(rq.error);
   });
 }
@@ -185,7 +188,10 @@ const pideIdb = (rq) => new Promise((ok, mal) => { rq.onsuccess = () => ok(rq.re
 async function huellaPrefijo(fichas) {
   const m = MODELS[clave] || {};
   const url = Array.isArray(m.url) ? m.url.map((f) => f.url).join('|') : String(m.url || '');
-  const texto = JSON.stringify([PREFIJO_FORMATO, url, m.bytes || 0, sesion?.state?.kvF16 ?? null, fichas.length, fichas.join(',')]);
+  // «cpu»: la foto de la CPU (caché f32 en la memoria del módulo) y la de la
+  // tarjeta tienen formatos distintos; con llaves distintas nunca se cruzan. Solo
+  // en la de CPU, para que las fotos de la tarjeta ya guardadas sigan valiendo.
+  const texto = JSON.stringify([PREFIJO_FORMATO, url, m.bytes || 0, sesion?.state?.kvF16 ?? null, ...(modoCpu ? ['cpu'] : []), fichas.length, fichas.join(',')]);
   const h = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(texto));
   return [...new Uint8Array(h)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
@@ -197,17 +203,18 @@ async function guardaPrefijo(fichas) {
   try {
     const [datos, llave] = await Promise.all([salida, huellaPrefijo(fichas)]);
     const db = await abrePrefijos();
-    const tx = db.transaction('fotos', 'readwrite');
-    const st = tx.objectStore('fotos');
-    await pideIdb(st.put({ t: Date.now(), fichas: Array.from(fichas), ...datos }, llave));
-    const todas = await pideIdb(st.getAllKeys());
-    if (todas.length > PREFIJO_GUARDADOS) {
-      const conT = [];
-      for (const k of todas) conT.push([k, (await pideIdb(st.get(k)))?.t || 0]);
-      conT.sort((a, b) => b[1] - a[1]);
-      for (const [k] of conT.slice(PREFIJO_GUARDADOS)) st.delete(k);
-    }
-    db.close();
+    try {
+      const tx = db.transaction('fotos', 'readwrite');
+      const st = tx.objectStore('fotos');
+      await pideIdb(st.put({ t: Date.now(), fichas: Array.from(fichas), ...datos }, llave));
+      const todas = await pideIdb(st.getAllKeys());
+      if (todas.length > PREFIJO_GUARDADOS) {
+        const conT = [];
+        for (const k of todas) conT.push([k, (await pideIdb(st.get(k)))?.t || 0]);
+        conT.sort((a, b) => b[1] - a[1]);
+        for (const [k] of conT.slice(PREFIJO_GUARDADOS)) st.delete(k);
+      }
+    } finally { db.close(); }
     console.log(`[engine] prefijo de sistema guardado en disco · ${fichas.length} fichas`);
   } catch (e) {
     console.warn('[engine] no se pudo guardar el prefijo de sistema:', e?.message || e);
@@ -218,10 +225,12 @@ async function cargaPrefijo(fichas) {
   try {
     const llave = await huellaPrefijo(fichas);
     const db = await abrePrefijos();
-    const st = db.transaction('fotos', 'readwrite').objectStore('fotos');
-    const d = await pideIdb(st.get(llave));
-    if (d) st.put({ ...d, t: Date.now() }, llave);
-    db.close();
+    let d;
+    try {
+      const st = db.transaction('fotos', 'readwrite').objectStore('fotos');
+      d = await pideIdb(st.get(llave));
+      if (d) st.put({ ...d, t: Date.now() }, llave);
+    } finally { db.close(); }
     if (!d || !Array.isArray(d.fichas) || d.fichas.length !== fichas.length || d.fichas.some((t, k) => t !== fichas[k])) return false;
     const ok = sesion.state.importaInstantanea('sistema', d);
     if (ok) console.log(`[engine] prefijo de sistema cargado de disco · ${fichas.length} fichas sin procesar`);

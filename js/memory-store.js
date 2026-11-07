@@ -95,28 +95,81 @@ export function memoryBackend({ writable = true } = {}) {
 
 const req = (r) => new Promise((ok, ko) => { r.onsuccess = () => ok(r.result); r.onerror = () => ko(r.error); });
 
+// An IndexedDB connection that survives the browser closing it. WebKit closes
+// connections on its own (a tab put to sleep, memory pressure, storage
+// evicted), and from then on every `db.transaction()` throws InvalidStateError
+// ("the database connection is closing"). So the connection is forgotten when
+// it closes or another tab asks for a new version, and a transaction that could
+// not start, or that the browser aborted, runs ONCE more on a new connection.
+// That retry never writes twice: an aborted transaction commits nothing, and a
+// transaction that fails for its own reasons (a constraint, the quota) is not
+// retried at all.
+//   open()   → Promise<IDBDatabase>, a new connection each call
+//   run(db)  → Promise of one transaction, settled when it completes or fails
+const CONNECTION_LOST = new Set(['InvalidStateError', 'AbortError', 'UnknownError']);
+export function idbConnection(open) {
+  let current = null;
+  let closed = false;
+  const forget = (p) => { if (current === p) current = null; };
+  const connect = () => {
+    if (current) return current;
+    const p = current = open().then((db) => {
+      db.onclose = () => forget(p);
+      db.onversionchange = () => { db.close(); forget(p); };
+      return db;
+    });
+    p.catch(() => forget(p));
+    return p;
+  };
+  return {
+    connect,
+    async tx(run) {
+      for (let retried = false; ; retried = true) {
+        if (closed) throw new OpError(ERR.unavailable);
+        const p = connect();
+        const db = await p;
+        try {
+          return await run(db);
+        } catch (e) {
+          if (retried || !CONNECTION_LOST.has(e?.name)) throw e;
+          forget(p);
+          try { db.close(); } catch { /* already closing */ }
+        }
+      }
+    },
+    async close() {
+      closed = true;
+      const p = current;
+      current = null;
+      if (p) (await p.catch(() => null))?.close();
+    },
+  };
+}
+
 export async function idbBackend(name, idb = globalThis.indexedDB) {
   if (!idb) throw new OpError(ERR.unavailable);
-  const open = idb.open(name, 1);
-  open.onupgradeneeded = () => {
-    const db = open.result;
-    for (const [n, s] of Object.entries(STORES)) {
-      if (db.objectStoreNames.contains(n)) continue;
-      const os = db.createObjectStore(n, { keyPath: s.keyPath });
-      for (const i of s.indexes) os.createIndex(i, i);
-    }
-  };
-  const db = await req(open);
-  db.onversionchange = () => db.close();
+  const conn = idbConnection(() => {
+    const open = idb.open(name, 1);
+    open.onupgradeneeded = () => {
+      const db = open.result;
+      for (const [n, s] of Object.entries(STORES)) {
+        if (db.objectStoreNames.contains(n)) continue;
+        const os = db.createObjectStore(n, { keyPath: s.keyPath });
+        for (const i of s.indexes) os.createIndex(i, i);
+      }
+    };
+    return req(open);
+  });
+  await conn.connect();
   return {
     writable: true,
     kind: 'idb',
-    async getAll(n) { return req(db.transaction(n, 'readonly').objectStore(n).getAll()); },
-    async get(n, k) { return req(db.transaction(n, 'readonly').objectStore(n).get(k)); },
+    getAll(n) { return conn.tx((db) => req(db.transaction(n, 'readonly').objectStore(n).getAll())); },
+    get(n, k) { return conn.tx((db) => req(db.transaction(n, 'readonly').objectStore(n).get(k))); },
     commit(ops) {
       if (!ops.length) return Promise.resolve();
       const names = [...new Set(ops.map((o) => o.store))];
-      return new Promise((ok, ko) => {
+      return conn.tx((db) => new Promise((ok, ko) => {
         const tx = db.transaction(names, 'readwrite');
         tx.oncomplete = () => ok();
         tx.onerror = () => ko(tx.error);
@@ -127,9 +180,9 @@ export async function idbBackend(name, idb = globalThis.indexedDB) {
           else if (o.del !== undefined) os.delete(o.del);
           else os.put(o.put);
         }
-      });
+      }));
     },
-    async close() { db.close(); },
+    close() { return conn.close(); },
   };
 }
 

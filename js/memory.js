@@ -23,6 +23,7 @@ import { gateWrite, proposeFromUser, newRid, hashFact, LIMITS, renderRules } fro
 import { assertConfig, appLabel } from './memory-config.js';
 import { sharedTuning, tuningFor } from './memory-tuning.js';
 import { t, formatWhen } from './memory-text.js';
+import { idbConnection } from './memory-store.js';
 
 // Transport timeouts, in milliseconds. Code constants, not tunables.
 export const READY_TIMEOUT = 8000;
@@ -42,24 +43,22 @@ export function memoryOutbox() {
   };
 }
 
-function idbOutbox(name, idb = globalThis.indexedDB) {
+export function idbOutbox(name, idb = globalThis.indexedDB) {
   if (!idb) return memoryOutbox();
-  let dbp = null;
-  const db = () => dbp || (dbp = new Promise((ok, ko) => {
+  // The connection is reopened if the browser closes it (see idbConnection).
+  const conn = idbConnection(() => new Promise((ok, ko) => {
     const r = idb.open(name, 1);
     r.onupgradeneeded = () => { if (!r.result.objectStoreNames.contains('outbox')) r.result.createObjectStore('outbox', { keyPath: 'id' }); };
     r.onsuccess = () => ok(r.result);
     r.onerror = () => ko(r.error);
   }));
-  const run = async (mode, fn) => {
-    const d = await db();
-    return new Promise((ok, ko) => {
-      const tx = d.transaction('outbox', mode);
-      const res = fn(tx.objectStore('outbox'));
-      tx.oncomplete = () => ok(res?.result);
-      tx.onerror = () => ko(tx.error);
-    });
-  };
+  const run = (mode, fn) => conn.tx((d) => new Promise((ok, ko) => {
+    const tx = d.transaction('outbox', mode);
+    const res = fn(tx.objectStore('outbox'));
+    tx.oncomplete = () => ok(res?.result);
+    tx.onerror = () => ko(tx.error);
+    tx.onabort = () => ko(tx.error || new Error('aborted'));
+  }));
   return {
     all: () => run('readonly', (s) => s.getAll()).catch(() => []),
     put: (x) => run('readwrite', (s) => s.put(x)),
