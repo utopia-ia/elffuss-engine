@@ -171,7 +171,10 @@ export function gemv2Forma({ tipo, filas, k, T = 1, nm = 1, maxCompartida = 1638
   const divide = (R) => lista.every((f) => f % R === 0);
   // Sin subgrupos, la suma final de los 32 carriles va por memoria de grupo (`red`): cuenta también.
   const compartida = (R, NSG) => (NSG > 1 ? nm * R * T * GEMV2_PARTES * 32 * 4 : 0) + (sg ? 0 : nm * R * T * 32 * 4);
-  const pedida = globalThis.__ELFFUSS_GEMV2_FORMA;
+  // También puede ser una función de la matriz ({ tipo, filas, k, T, nm }) que
+  // devuelve la forma o null (la de siempre), para barrer una sola matriz.
+  const g = globalThis.__ELFFUSS_GEMV2_FORMA;
+  const pedida = typeof g === 'function' ? g({ tipo, filas: lista, k, T, nm }) : g;
   if (pedida && typeof pedida === 'object') {
     const { R, NSG } = pedida;
     if (![1, 2, 4, 8].includes(R) || ![1, 2, 4].includes(NSG)) {
@@ -185,7 +188,10 @@ export function gemv2Forma({ tipo, filas, k, T = 1, nm = 1, maxCompartida = 1638
   }
   const q8 = tipo === 'Q8_0' || tipo === 'Q8_0R';
   let R = q8 ? 2 : tipo === 'Q6_K' ? 2 : 4;
-  let NSG = q8 ? 4 : 1;
+  // K en 4 subgrupos para todos los formatos. Q4_0 y Q6_K iban con uno solo, y al
+  // escribir (un token) eso dejaba pocos hilos en marcha: medido en LFM3 QAD-Q4_0,
+  // seis rondas alternas, R4·S4 escribe ×1,25 más rápido que R4·S1, mismo texto (7-nov).
+  let NSG = 4;
   if (Math.min(...lista) <= 512) { NSG = 4; R = Math.min(R, 2); }
   // Con varios tokens las activaciones de cada token viven en registros (y en
   // Q4_0/Q6_K también su copia preescalada): mejor una partición por carril.

@@ -96,6 +96,7 @@ export function createFusionOps(ops, opts = {}) {
   // `createNNOps` para que el árbol de la suma sea el mismo.
   const WG = opts.wgNorm || WG_FILA;
   const WG_CONV = 64;
+  const WG_DECODE = 1024;
   const pipe = (key, code) => ctx.pipeline(key, code);
   // `dispatchAny` reparte los grupos en dos ejes pasado el tope por eje, y los
   // shaders recomponen el índice con el mismo tope (AXIS).
@@ -129,8 +130,15 @@ export function createFusionOps(ops, opts = {}) {
     // entrada normalizada de la siguiente operación.
     async normaResidual(lo, res, wPost, wSig, rows, ne0, eps) {
       const post = !!wPost;
-      const p = await pipe(`fusion_norma_residual_${WG}_${post ? 'post' : 'llana'}`,
-        () => normaResidualShader({ wg: WG, post }));
+      // Al escribir (una fila) el grupo de 128 hilos dejaba la tarjeta esperando
+      // a una suma de 2.048 números: con 1.024 hilos escribe ×1,07-1,13 más rápido
+      // en LFM3 Q4_0 y Q8_0, mismo texto (barrido del 7-nov, rondas alternas). Al
+      // leer (muchas filas) el ancho de siempre rinde más y mantiene la suma bit a
+      // bit igual a la cadena. Sin pasar del tope de hilos por grupo del dispositivo.
+      const lim = ctx.device?.limits || {};
+      const W = rows === 1 ? Math.min(WG_DECODE, lim.maxComputeInvocationsPerWorkgroup || WG, lim.maxComputeWorkgroupSizeX || WG) : WG;
+      const p = await pipe(`fusion_norma_residual_${W}_${post ? 'post' : 'llana'}`,
+        () => normaResidualShader({ wg: W, post }));
       const xo = ctx.alloc(rows * ne0 * 4, 'fusion.res');
       const nrm = ctx.alloc(rows * ne0 * 4, 'fusion.nrm');
       // El mismo eps que `nn.rmsnorm` (f32 del número del perfil) y el cero de

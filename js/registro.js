@@ -71,6 +71,11 @@ export const MODELS = {
     // muere; 64, 128 y 256 contestan, y 128 lee el prompt ×1,23 más rápido que 64
     // (256 no gana a 128 y pide más memoria).
     lote: 128,
+    // En un ordenador (tarjeta con subgrupos y navegador que no es de móvil) el
+    // límite de la pestaña no aprieta, y 128 dejaba la mitad de la lectura en la
+    // mesa: con 512 lee un mensaje de ~1.000 tokens ×1,99 más rápido, misma
+    // escritura (barrido del 7-nov, rondas alternas). 256 y 1024 quedan igual.
+    loteOrdenador: 512,
     licencia: 'https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/blob/bad5729bba61d076fff20d2548e62526665af215/LICENSE',
   },
 

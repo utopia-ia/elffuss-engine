@@ -170,10 +170,17 @@ export function createMemory(cfg, {
     if (!doc) { mode = 'off'; return { mode, count: 0, grant: null, enabled: { read: false, write: false } }; }
     ensureFrame();
     const rid = newRid();
-    const deadline = now() + READY_TIMEOUT * slow;
+    // The budget counts only time the page was free to hear the answer. The store
+    // shares this page's process: while the page is busy (loading a model, for
+    // example) a hello can come back seconds late through no fault of the store,
+    // and a wall-clock deadline gave up just before it answered. Each attempt is
+    // charged at most two intervals, however long it really took.
+    let gastado = 0;
     let d = null;
-    while (!d && now() < deadline) {
+    while (!d && gastado < READY_TIMEOUT * slow) {
+      const t0 = now();
       d = await once('hello', { client: 2, engine: null }, rid, HELLO_INTERVAL);
+      gastado += Math.min(Math.max(0, now() - t0), 2 * HELLO_INTERVAL);
     }
     if (!d || !d.ok) return goOff();
     hello = d.result;
