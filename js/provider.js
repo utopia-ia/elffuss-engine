@@ -1127,6 +1127,8 @@ export function ultimaMedida() { return medida; }
  * cuando una app lo pide: el chat no lo descarga si no habla.
  */
 export const cargaVoz = () => import('./moss.js');
+/** Lo mismo en la CPU (moss-cpu.js), para quien no tiene WebGPU. */
+export const cargaVozCpu = () => import('./moss-cpu.js');
 
 /**
  * Qué modelo está activo, para poder ETIQUETAR las medidas.

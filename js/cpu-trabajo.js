@@ -28,7 +28,7 @@ export const MAX_MATRICES = 4;
 export const PASO_DESC = 18;
 export const CTL = 16 + PASO_DESC * MAX_MATRICES;
 // Kernels repartibles: los productos por filas y la atención por cabezas.
-export const KERNEL = { matvec_q4_0: 1, matvec_q8_0: 2, matmul_q4_0: 3, matmul_q8_0: 4, atencion: 5, swiglu: 6, norma: 7 };
+export const KERNEL = { matvec_q4_0: 1, matvec_q8_0: 2, matmul_q4_0: 3, matmul_q8_0: 4, atencion: 5, swiglu: 6, norma: 7, matmul_bf16: 8 };
 
 // ctl[9] = generación (19 bits) · índice del trozo (12 bits). Un hilo que se
 // despertó tarde lleva la generación de un trabajo ya acabado: su petición no
@@ -62,6 +62,7 @@ export function ejecutaTrozo(e, c, i, yo) {
     case 2: e.matvec_q8_0(W, a, out, k, r0, r1); break;
     case 3: e.matmul_q4_0(W, a, out, k, filas, T, r0, r1); break;
     case 4: e.matmul_q8_0(W, a, out, k, filas, T, r0, r1); break;
+    case 8: e.matmul_bf16(W, a, out, k, filas, T, r0, r1); break;
     case 6: e.swiglu_cuantiza(W, a, out, r0, r1); break;
     case 7: e.norma_cuantiza(W, a, out, c[b + 4] >>> 0, c[b + 9], r0, r1, leeFloat(c, b + 16)); break;
     case 5: e.atencion_cabezas(W, a, out, c[b + 4] >>> 0, (c[b + 9] >>> 0) + yo * c[b + 10] * 4, r0, r1,
